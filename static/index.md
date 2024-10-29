@@ -193,4 +193,7 @@ Output 3 = GPIO 8
 Output 4 = GPIO 10
 Output 5 = GPIO 20
 Output 6 = GPIO 19
+RS-485 Port:
+  TX = GPIO 2
+  RX = GPIO 1
 ```
