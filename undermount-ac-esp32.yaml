@@ -1,4 +1,5 @@
 ##  030925 - First public release
+##  030925 - Fixed bug that caused fan speed to be at 100%
 
 ##  ToDo - Tekmar T-stat 50% duty cycle is 20 min on, 20 min off, when temp is -1.5 to +1.5 degree of setpoint as follows:
 ##         100% on time at Heat To setting -1.5°F
@@ -568,7 +569,7 @@ climate:
     heat_action:
       # set min and max fan speeds for normal operation - to protect equipment
       - lambda: id(blower_pwm).set_min_power(0.15);
-      - lambda: id(blower_pwm).set_max_power(0.98);
+      - lambda: id(blower_pwm).set_max_power(0.65); //Heat coil does not need a great deal of airflow
       - switch.turn_off: air_cond
       - lambda: id(floor_pump_state) = 1; //Set state to on for floor pump
       - switch.turn_on: floor_pump
@@ -576,7 +577,7 @@ climate:
       - switch.turn_on: diesel_burner
       - delay: 20s
       - lambda: id(fan_lower_temp) = ${supplemental_heating_diff} - ${fan_hysteresis};
-      - lambda: id(fan_raise_temp) = ${supplemental_heating_diff};
+      - lambda: id(fan_raise_temp) = ${supplemental_heating_diff} + ${fan_hysteresis};
       - lambda: id(supplemental_diff) = ${supplemental_heating_diff};
       - lambda: id(climate_action) = 3;
       - logger.log:
@@ -595,7 +596,7 @@ climate:
       - delay: 20s
       - fan.turn_on: blower_fan
       - lambda: id(fan_lower_temp) = ${supplemental_cooling_diff} - ${fan_hysteresis};
-      - lambda: id(fan_raise_temp) = ${supplemental_cooling_diff};
+      - lambda: id(fan_raise_temp) = ${supplemental_cooling_diff} + ${fan_hysteresis};
       - lambda: id(supplemental_diff) = ${supplemental_cooling_diff};
       - lambda: id(climate_action) = 2;
       - logger.log:
@@ -667,11 +668,14 @@ climate:
     max_heating_run_time: 30min 
     supplemental_heating_delta: ${supplemental_heating_diff} # when the delta between target temp and current temp is > than this value (appears to only work in °C)
     supplemental_heating_action:
-      - fan.turn_on: blower_fan
+      - logger.log:
+          format: "Calling supplemental_heating_action (will delay 60 sec)"
       - lambda: id(heat_coil_bypass_state) = 0; //Set state to off for bypass
       - switch.turn_off: heat_coil_bypass
+      - delay: 60s # delay before turning fan on so heat coil gets warm
+      - fan.turn_on: blower_fan
       - lambda: id(fan_lower_temp) = ${supplemental_heating_diff} - ${fan_hysteresis};
-      - lambda: id(fan_raise_temp) = ${supplemental_heating_diff};
+      - lambda: id(fan_raise_temp) = ${supplemental_heating_diff} + ${fan_hysteresis};
       - lambda: id(supplemental_diff) = ${supplemental_heating_diff};
       - logger.log:
           format: "Called supplemental_heating_action"
@@ -736,12 +740,13 @@ script:
       - lambda: |-
           if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO)
           { 
+            id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature);
             if(id(blower_fan).state)  //If fan is on 
             {
               if ( id(climate_action) == 0)
               {
                 id(fan_lower_temp) = id(supplemental_diff) - ${fan_hysteresis};
-                id(fan_raise_temp) = id(supplemental_diff);
+                id(fan_raise_temp) = id(supplemental_diff) + ${fan_hysteresis};
                 auto call = id(blower_fan).turn_off();
                 call.set_speed(0);
                 call.perform();
@@ -749,7 +754,6 @@ script:
               }
               else 
               {
-                id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature);
                 if (id(diff) > id(fan_raise_temp))
                 {
                   if (id(current_fan) < 81)
@@ -769,7 +773,7 @@ script:
                   call.set_speed(id(current_fan));
                   call.perform();
                 }
-                if (id(diff) < id(fan_lower_temp))
+                else if (id(diff) < id(fan_lower_temp))
                 {
                   if (id(climate_action) == 2 && id(diff) < ${supplemental_cooling_diff}); //if A/C on and difference is smaller turn off fast compressor speed
                     id(supplemental_enabled).turn_off(); 
@@ -779,13 +783,14 @@ script:
                     id(fan_raise_temp) -= ${fan_hysteresis} * 2;
                     if (id(fan_lower_temp) < 2.0)
                     {
-                      id(fan_lower_temp) = id(supplemental_diff)- ${fan_hysteresis};
-                      id(fan_raise_temp) = id(supplemental_diff);
+                      id(fan_lower_temp) = id(supplemental_diff) - ${fan_hysteresis};
+                      id(fan_raise_temp) = id(supplemental_diff) + ${fan_hysteresis};
                     }
                     id(current_fan) -= 20; //Decrease fan speed
                   }
-                  else
-                    id(current_fan) = 0; //Decrease fan speed
+                  //If the fan speed is in between, leave it the same
+                  
+                  //Actually set the fan speed  
                   auto call = id(blower_fan).make_call();
                   call.set_speed(id(current_fan));
                   call.perform();
@@ -818,9 +823,9 @@ script:
           else  //should not get here!!!
           {
             auto call = id(blower_fan).turn_off();
-            call.set_speed(100);  //Have fan full blast to protect compressor
+            call.set_speed(0);
             call.perform();
-            id(current_fan) = 100;
+            id(current_fan) = 0;
           }
           
       - logger.log:
