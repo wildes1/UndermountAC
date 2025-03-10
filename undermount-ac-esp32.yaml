@@ -1,9 +1,38 @@
-## written by https://github.com/mikegoubeaux for UndermountAC https://undermountac.com/pages/hass
+##  030925 - First public release
 
-# If you want to change the friendly name of your controller, do so below
+##  ToDo - Tekmar T-stat 50% duty cycle is 20 min on, 20 min off, when temp is -1.5 to +1.5 degree of setpoint as follows:
+##         100% on time at Heat To setting -1.5°F
+##         50% on time at Heat To setting
+##         0% on time at Heat To setting + 1.5°F
+##
+## originally written by https://github.com/mikegoubeaux for UndermountAC https://undermountac.com/pages/hass
+## modified for heat/cool with a commercially available hydronic radiant heat system for vans
+## Not for Rixen controls, Mike has an excellent standalone thermostat for them in his github https://github.com/mikegoubeaux
+## NOTE: USE AT YOUR OWN RISK, this is preliminary and under active development
+## 
+
+# Change things like wifi ssid's and passwords, etc here
 substitutions:
-  name: "undermount-ac"
-  friendly_name: "Undermount AC"
+  # If you want to change the friendly name of your controller, do so below
+  name: "ac-control"
+  friendly_name: "HVAC"
+  # OTA password for OTA updates
+  ota_pw: !secret ac_control_ota_pw
+  # Wifi ssid, passwords, etc
+  wifi_ssid: !secret wifi_ssid
+  encryption_key: !secret ac_control_encryption_pw
+  wifi_password: !secret wifi_password
+  ac_control_backup_wifi_pw: !secret ac_control_backup_wifi_pw
+  fallback_hotspot_name: "Ac-Control Fallback Hotspot"
+  
+  # Constants for climate and fan staging setup, works for both yaml and lambda (sort of like #define in C)
+  fan_hysteresis: "0.4"
+  supplemental_cooling_diff: "2.4"
+  supplemental_heating_diff: "1.4"
+
+  #One Wire temp sensor address and GPIO
+  one_wire_address: "0x13011312B96FAA28"
+  one_wire_gpio: "GPIO12"
 
 esphome:
   name: "${name}"
@@ -12,11 +41,11 @@ esphome:
   # so you can use a single firmware for all devices
   name_add_mac_suffix: false
 
-  # This will allow for (future) project identification,
-  # configuration and updates.
-  project:
-    name: mikeg.undermount-ac
-    version: "1.1"
+#  # This will allow for (future) project identification,
+#  # configuration and updates. Also needed for dashboard_import below
+#  project:
+#    name: wildes1.undermount-ac
+#    version: "0.1"
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -25,26 +54,42 @@ esp32:
 
 # To be able to get logs from the device via serial and api.
 logger:
+  level: DEBUG
+  
+## This should point to the public location of this yaml file.
+#dashboard_import:
+#  package_import_url: github://wildes1/UndermountAC/undermount-ac-esp32.yaml@main
+#  import_full_config: true
 
-# API is a requirement of the dashboard import.
+##########################################################
+# API and Wifi setup 
+# Some installs need domain for consistent over the air updates, most are .lan, change or comment out if necessary
+##########################################################
+
+# Enable Home Assistant API
 api:
+  encryption:
+    key: ${encryption_key}
 
-# OTA is required for Over-the-Air updating
 ota:
-
-# This should point to the public location of this yaml file.
-dashboard_import:
-  package_import_url: github://mikegoubeaux/UndermountAC/undermount-ac-esp32.yaml@main
-  import_full_config: true
+  - platform: esphome
+    password: ${ota_pw}
 
 wifi:
-  # Set up a wifi access point using the device name above
-  ap:
-    password: "12345678"
+  ssid: ${wifi_ssid}
+  password: ${wifi_password}
 
-# In combination with the `ap` this allows the user
-# to provision wifi credentials to the device.
+  domain: .lan
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: $fallback_hotspot_name
+    password: ${ac_control_backup_wifi_pw}
+
+## In combination with the `ap` this allows the user
+## to provision wifi credentials to the device.
 captive_portal:
+
 
 ##########################################################
 # Most projects should not remove anything from above here
@@ -56,7 +101,92 @@ captive_portal:
 # Handy if your device has a usb port for the user to add credentials when they first get it.
 improv_serial:
 
-# Satus LED
+globals:
+  - id: last_floor  #last valid (under 84.0C) floor temp measured
+    type: float
+    restore_value: no
+    initial_value: "25"
+
+  - id: floor_temp_value  #floor temp measured for lambdas
+    type: float
+    restore_value: no
+    initial_value: "25"
+
+  - id: floor_temp_limit  #floor temp limit when the floor pump should be turned off (90F)
+    type: float
+    restore_value: no
+    initial_value: "90"
+
+  # This is set to either supplemental_heating_diff or supplemental_cooling_diff depending on action
+  - id: supplemental_diff
+    type: float
+    restore_value: no
+    initial_value: "1.2"
+
+  - id: fan_raise_temp  #temp diff to raise fan speed
+    type: float
+    restore_value: no
+    initial_value: "0.4"
+
+  - id: fan_lower_temp  #temp diff to lower fan speed
+    type: float
+    restore_value: no
+    initial_value: "0.2"
+
+  - id: diff  #temp difference
+    type: float
+    restore_value: no
+    initial_value: "90"
+
+  - id: current_fan  #current fan speed set
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: floor_pump_state #on when 1 - stage 1 heat, use with diesel burner, will have cutout based on floor temp
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: diesel_burner_state #on when 1 - calling for stage 1, 2 - calling for stage 2, 3 - calling for hot water
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: heat_coil_bypass_state #0 or off = through heat coil, 1 = on = bypass heat coil
+    type: int
+    restore_value: no
+    initial_value: "1"
+
+  - id: climate_action #0 = off, 2 = cool, 3 = heat, 6 = fan only, 4 = idle
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+##########################################################
+#Modbus stuff to read and write DFRobot FIT0827 (CSIO-404)
+##########################################################
+uart:
+  - id: uart_modbus_server
+    tx_pin: GPIO2 #verified on board
+    rx_pin: GPIO1 #verified on board
+    baud_rate: 9600
+    #stop_bits: 1
+    debug:
+
+modbus:
+  - uart_id: uart_modbus_server
+    id: modbus_server
+    role: server
+
+modbus_controller:
+  - id: csio_1
+    modbus_id: modbus_server
+    address: 0xfe #Broadcast address works on units as shipped from Undermount AC (Default address of 0 does not work per doc)
+
+#binary_sensor: #no binary_sensors
+
+# Status LED
 light:
   # ESPHome status LED - controls an output (to use onboard RGB LED)
   - platform: status_led
@@ -101,7 +231,7 @@ light:
 
 
 output:
-  # output to use ESPHome status_led with ESP32-S3 onboard addressable LED
+# output to use ESPHome status_led with ESP32-S3 onboard addressable LED
   - platform: template
     id: statusoutput
     type: binary
@@ -140,8 +270,29 @@ i2c:
   scan: true
   id: bus_a
 
+# One Wire for floor sensor
+one_wire:
+  - platform: gpio
+    pin: 13
+
 sensor:
-  
+  # One Wire floor temp sensor
+  - platform: dallas_temp
+    address: ${one_wire_address}
+    id: floor_temp
+    name: "Floor Temperature"
+    filters:
+      # One Wire sensor occasionally reads 85C (all 1's), report last temp measured when it does this
+    - lambda: |-
+        if (x > 84.0)
+          x =  id(last_floor);
+        else
+          id(last_floor) = x;
+        id(floor_temp_value) = x; //store for other lambdas  
+        return x * (9.0/5.0) + 32.0;
+    unit_of_measurement: "°F"    
+    #update_interval: never
+
   # onboard SHT30 temp/humidity sensor
   - platform: sht3xd
     i2c_id: bus_a
@@ -171,28 +322,173 @@ sensor:
           } else {
             return 0.0;
           }
-            
+#  # compressor high speed sensor          
+#  - platform: template
+#    id: comp_high_speed_diagnostic
+#    name: Compressor High Speed On
+#    accuracy_decimals: 0
+#    unit_of_measurement: "1.0=On"
+#    device_class: ""
+#    #entity_category: "diagnostic"
+#    icon: mdi:air-conditioner
+#    update_interval: 30s
+#    filters:
+#      # simulate clamped fan speed values 
+#      - lambda: |-
+#          if(id(compressor_speed_high).state) {
+#            return 1.0;
+#          } else {
+#            return 0.0;
+#          }
 
 switch:
+##########################################################
+#Modbus stuff to read and write DFRobot FIT0827 (CSIO-404)
+##########################################################
+  # Diesel Burner control
+  # uses diesel_burner_state to turn on and off as I don't yet know how to extract state
+  #   in a lambda, ToDo try later
+  - platform: modbus_controller
+    id: diesel_burner
+    modbus_controller_id: csio_1
+    name: "Diesel Burner Control"
+    # Relay 1, address 0
+    #address: 0 #0:relay1 1:relay2 ...
+    #register_type: coil
+    bitmask: 0x1
+    # custom command with no payload gets rid of "function code: 0x1 exception: 2" error
+    custom_command: [ ]
+    # implement using write_lambda
+    write_lambda: |-
+      payload.push_back(0xfe);  // device address
+      payload.push_back(0x5);  // force single coil
+      payload.push_back(0x00); // high byte address of the coil
+      payload.push_back(0x00);  // low byte address of the coil
+      if (id(diesel_burner_state) == 1) 
+      {
+        payload.push_back(0xff); // ON
+        id(diesel_burner).publish_state(true);
+      }
+      else 
+      {
+        payload.push_back(0x00); // OFF
+        id(diesel_burner).publish_state(false);
+      }
+      payload.push_back(0x00);  //Rest of ON or OFF
+      if (id(diesel_burner_state) == 0) 
+        return 0;
+      else
+        return 1;
+##########################################################
+  # Heat Coil Bypass Valve
+  # uses heat_coil_bypass_state to turn on and off as I don't yet know how to extract state
+  #   in a lambda, ToDo try later
+  - platform: modbus_controller
+    id: heat_coil_bypass
+    modbus_controller_id: csio_1
+    name: "Heat Coil Bypass (Off = Goes through Heat Coil)"
+    # Relay 2, address 1
+    #address: 1 #0:relay1 1:relay2 ...
+    #register_type: coil
+    bitmask: 0x1
+    # custom command with no payload gets rid of "function code: 0x1 exception: 2" error
+    custom_command: [ ]
+    # implement using write_lambda
+    write_lambda: |-
+      payload.push_back(0xfe);  // device address
+      payload.push_back(0x5);  // force single coil
+      payload.push_back(0x00); // high byte address of the coil
+      payload.push_back(0x01);  // low byte address of the coil
+      if (id(heat_coil_bypass_state) == 1) 
+      {
+        payload.push_back(0xff); // ON
+        id(heat_coil_bypass).publish_state(true);
+      }
+      else 
+      {
+        payload.push_back(0x00); // OFF
+        id(heat_coil_bypass).publish_state(false);
+      }
+      payload.push_back(0x00);  //Rest of ON or OFF
+      if (id(heat_coil_bypass_state) == 0) 
+        return 0;
+      else
+        return 1;
+##########################################################
+  # Floor Pump control
+  # uses floor_pump_state to turn on and off as I don't yet know how to extract state
+  #   in a lambda, ToDo try later
+  - platform: modbus_controller
+    id: floor_pump
+    modbus_controller_id: csio_1
+    name: "Floor Pump Control"
+    # Relay 3, address 2
+    #address: 2 #0:relay1 1:relay2 ...
+    #register_type: coil
+    bitmask: 0x1
+    # custom command with no payload gets rid of "function code: 0x1 exception: 2" error
+    custom_command: [ ]
+    # implement using write_lambda
+    write_lambda: |-
+      payload.push_back(0xfe);  // device address
+      payload.push_back(0x5);  // force single coil
+      payload.push_back(0x00); // high byte address of the coil
+      payload.push_back(0x02);  // low byte address of the coil
+      if (id(floor_pump_state) == 1) 
+      {
+        if (id(floor_temp_value) > id(floor_temp_limit))  //Turn off if over floor temp limit
+        {
+          payload.push_back(0x00); // OFF
+          id(floor_pump).publish_state(false);
+        }
+        else if (id(floor_temp_value) < id(floor_temp_limit)-4) //Turn on if under floor temp limit - 4 degrees F
+        {
+          payload.push_back(0xff); // ON
+          id(floor_pump).publish_state(true);
+        }
+      }
+      else 
+      {
+        payload.push_back(0x00); // OFF
+        id(floor_pump).publish_state(false);
+      }
+      payload.push_back(0x00);  //Rest of ON or OFF
+      if (id(floor_pump_state) == 0) 
+        return 0;
+      else
+        return 1;
+
+##########################################################
+##########################################################
+  #One Wire sensor power (allows reset of sensor if it's troublesome as it's permanently in the floor, leave on for now)
+##########################################################
+  - platform: gpio
+    pin: ${one_wire_gpio}
+    id: 'one_wire_sw'
+    name: "One Wire Sensor Power"
+    restore_mode: ALWAYS_ON
+##########################################################
+    
   # compressor on/off
   - platform: gpio
+    name: Compressor Power (do not move)
     id: air_cond
     pin:
       number: 8
       inverted: true
     restore_mode: ALWAYS_OFF
-    internal: true
+    internal: false
 
   # compressor high speed on/off
   - platform: gpio
     pin:
       number: 10
       inverted: true
-    name: Compressor High Speed
+    name: Compressor High Speed (do not move)
     id: compressor_speed_high
     internal: false
     restore_mode: ALWAYS_OFF
-    disabled_by_default: true
+    #disabled_by_default: true
     on_turn_on:
       # set minimum fan speed to 70% when compressor is on high
       - lambda: id(blower_pwm).set_min_power(0.60);
@@ -231,69 +527,154 @@ fan:
     name: "Blower"
     output: blower_pwm
     id: blower_fan
-    disabled_by_default: true
+#    disabled_by_default: true
     on_turn_off:
       - lambda: id(fan_speed_diagnostic).publish_state(id(blower_fan).speed);
+      - logger.log:
+          format: "Called fan on_turn_off"
     on_speed_set:
       - lambda: id(fan_speed_diagnostic).publish_state(id(blower_fan).speed);
+      - logger.log:
+          format: "Called fan on_speed_set"
   
 
 climate:
   - platform: thermostat
-    name: "Air Conditioning"
+    name: "Thermostat"
     id: this_thermostat
     sensor: onboard_temperature
     visual:
-      temperature_step: 1.0
-      min_temperature: 50 °F
-      max_temperature: 85 °F
+      temperature_step: 0.5
+      min_temperature: 39.9999999 °F  #40 °F gave errors when clicking "-" from 41 to 40
+      max_temperature: 100.00001 °F   #assume 100 will do the same as above
 
     # these are the recommended values from UndermountAC
-    min_cooling_off_time: 2min # should be no less than "2min"
-    min_cooling_run_time: 2min # should be no less than "2min" to avoid short cycling
-    min_idle_time: 5s # may not really be necessary in a cooling only thermostat and the above settings
+    # recommended values cycled too much, using 6 cycles per hour
+    min_cooling_off_time: 3min # should be no less than "2min"
+    min_cooling_run_time: 7min # should be no less than "2min" to avoid short cycling
+    min_idle_time: 120s # necessary for heat/cool with auto changeover
+    min_heating_off_time: 3min
+    min_heating_run_time: 7min
     min_fanning_off_time: 30s
     min_fanning_run_time: 30s
     
+    # Added cool_overrun and cool_deadband, changed both from 0.5C default
+    cool_overrun: 0.25
+    cool_deadband: 0.25
+    heat_overrun: 0.25
+    heat_deadband: 0.25
+
     # actions for each thermostat state - manage the call for ac, compressor speed, and fan on/of
+    heat_action:
+      # set min and max fan speeds for normal operation - to protect equipment
+      - lambda: id(blower_pwm).set_min_power(0.15);
+      - lambda: id(blower_pwm).set_max_power(0.98);
+      - switch.turn_off: air_cond
+      - lambda: id(floor_pump_state) = 1; //Set state to on for floor pump
+      - switch.turn_on: floor_pump
+      - lambda: id(diesel_burner_state) = 1; //Set state to on for diesel burner
+      - switch.turn_on: diesel_burner
+      - delay: 20s
+      - lambda: id(fan_lower_temp) = ${supplemental_heating_diff} - ${fan_hysteresis};
+      - lambda: id(fan_raise_temp) = ${supplemental_heating_diff};
+      - lambda: id(supplemental_diff) = ${supplemental_heating_diff};
+      - lambda: id(climate_action) = 3;
+      - logger.log:
+          format: "Called heat_action"
     cool_action:
       # set min and max fan speeds for normal operation - to protect equipment
-      - lambda: id(blower_pwm).set_min_power(0.40);
+      - lambda: id(blower_pwm).set_min_power(0.40); 
       - lambda: id(blower_pwm).set_max_power(0.98);
+      - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
+      - switch.turn_off: floor_pump
+      - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
+      - switch.turn_off: diesel_burner
+      - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
+      - switch.turn_on: heat_coil_bypass
       - switch.turn_on: air_cond
       - delay: 20s
       - fan.turn_on: blower_fan
+      - lambda: id(fan_lower_temp) = ${supplemental_cooling_diff} - ${fan_hysteresis};
+      - lambda: id(fan_raise_temp) = ${supplemental_cooling_diff};
+      - lambda: id(supplemental_diff) = ${supplemental_cooling_diff};
+      - lambda: id(climate_action) = 2;
+      - logger.log:
+          format: "Called cool_action"
     idle_action:
+      - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
+      - switch.turn_off: diesel_burner
       - switch.turn_off: air_cond
       - switch.turn_off: compressor_speed_high
-      - lambda: id(blower_pwm).set_max_power(0.50); # ramp down fan
-      - delay: 20s # delay before turning fan off to push out any final cold air
+      #- lambda: id(blower_pwm).set_max_power(0.40); # ramp down fan
+      - delay: 60s # delay before turning fan off to push out any final cold air
+      - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
+      - switch.turn_on: heat_coil_bypass
+      - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
+      - switch.turn_off: floor_pump
       - fan.turn_off: blower_fan
+      - lambda: id(climate_action) = 4;
+      - logger.log:
+          format: "Called idle_action"
     fan_only_action:
+      - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
+      - switch.turn_off: floor_pump
+      - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
+      - switch.turn_off: diesel_burner
+      - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
+      - switch.turn_on: heat_coil_bypass
       - switch.turn_off: air_cond
       - switch.turn_off: compressor_speed_high
       # set min and max fan speeds to wider range
-      - lambda: id(blower_pwm).set_min_power(0.05);
+      - lambda: id(blower_pwm).set_min_power(0.15);
       - lambda: id(blower_pwm).set_max_power(0.98);
+      - delay: 20s
       - fan.turn_on: blower_fan
+      - lambda: id(climate_action) = 6;
+      - logger.log:
+          format: "Called fan_only_action"
     off_mode:
+      - logger.log:
+          format: "Called climate Off Mode"
+      - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
+      - switch.turn_off: diesel_burner
       - switch.turn_off: air_cond
       - switch.turn_off: compressor_speed_high
-      - delay: 20s # delay before turning fan off to push out any final cold air
+      - delay: 60s # delay before turning fan off to push out any final cold air
+      - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
+      - switch.turn_on: heat_coil_bypass
+      - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
+      - switch.turn_off: floor_pump
       - fan.turn_off: blower_fan
       # set min and max fan speeds to full range - in case fan is used by itself
-      - lambda: id(blower_pwm).set_min_power(0.05);
-      - lambda: id(blower_pwm).set_max_power(1.0);
+      - lambda: id(blower_pwm).set_min_power(0.15);
+      - lambda: id(blower_pwm).set_max_power(0.98);
+      - lambda: id(climate_action) = 0;
+      - logger.log:
+          format: "Called off_mode"
     
-    # turn the compressor to HIGH under these conditions:
+    # turn the compressor to HIGH under these conditions, was 30 min and 5C:
+    set_point_minimum_differential: 0.25
     max_cooling_run_time: 30min 
-    supplemental_cooling_delta: 5 # when the delta between target temp and current temp is > than this value (appears to only work in °C)
+    supplemental_cooling_delta: ${supplemental_cooling_diff} # when the delta between target temp and current temp is > than this value (appears to only work in °C)
     supplemental_cooling_action:
       - if:
           condition:
             - switch.is_on: supplemental_enabled
           then:
             - switch.turn_on: compressor_speed_high
+      - lambda: id(supplemental_diff) = ${supplemental_cooling_diff};
+    # heat 1st stage no fan, 2nd stage fan, fan speed determined by delta t in update_fan_speed script        
+    max_heating_run_time: 30min 
+    supplemental_heating_delta: ${supplemental_heating_diff} # when the delta between target temp and current temp is > than this value (appears to only work in °C)
+    supplemental_heating_action:
+      - fan.turn_on: blower_fan
+      - lambda: id(heat_coil_bypass_state) = 0; //Set state to off for bypass
+      - switch.turn_off: heat_coil_bypass
+      - lambda: id(fan_lower_temp) = ${supplemental_heating_diff} - ${fan_hysteresis};
+      - lambda: id(fan_raise_temp) = ${supplemental_heating_diff};
+      - lambda: id(supplemental_diff) = ${supplemental_heating_diff};
+      - logger.log:
+          format: "Called supplemental_heating_action"
 
     # define presets here to use within HA
     on_boot_restore_from: memory
@@ -301,22 +682,26 @@ climate:
     default_preset: Standby
     preset:
       - name: Home
-        default_target_temperature_high: 75 °F
+        default_target_temperature_high: 90 °F
+        default_target_temperature_low: 40 °F
         fan_mode: AUTO
         mode: cool
       - name: Standby
-        default_target_temperature_high: 75 °F
+        default_target_temperature_high: 90 °F
+        default_target_temperature_low: 40 °F
         fan_mode: AUTO
         mode: "OFF"
       - name: Sleep
-        default_target_temperature_high: 71 °F
+        default_target_temperature_high: 90 °F
+        default_target_temperature_low: 40 °F
         fan_mode: low
         mode: cool
     
     # fan modes are available in the Climate card in HA Frontend and can be called with "climate.set_fan_mode" in automations
     # these speeds are mapped to the above clamped PWM output values so the fan will never go too low
+    
     min_fan_mode_switching_time: 5s # probably not needed - delays before changing fan speed
-    fan_only_cooling: true
+    fan_only_cooling: false
     fan_mode_low_action:
       # placeholder action - as the fan is dealt with in the script block below
       - logger.log: "Fan is in Low"
@@ -335,64 +720,119 @@ climate:
 
     # when any state change occurs on the Thermostat
     on_state:
+      - logger.log:
+          format: "Called on_state line 833"
       - script.execute: update_fan_speed
       - script.execute: status_light_update
 
 
 script:
-  # Update Fan Speed
+  # Update Fan Speed, temp diffs in deg C, 0.5556 deg C = 1 deg F!!! Were 0.5, 1.0, 2.5, med blower speed was 50
+  # Changed to work both for cooling and heating 2nd stage (supplemental)
   - id: update_fan_speed
     then:
+      - logger.log:
+          format: "Called update_fan_speed script"
       - lambda: |-
-          if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO) {
-            if ( id(this_thermostat).current_temperature > id(this_thermostat).target_temperature +3.5 ) {
-              auto call = id(blower_fan).make_call();
-              call.set_speed(100);
-              call.perform();
+          if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO)
+          { 
+            if(id(blower_fan).state)  //If fan is on 
+            {
+              if ( id(climate_action) == 0)
+              {
+                id(fan_lower_temp) = id(supplemental_diff) - ${fan_hysteresis};
+                id(fan_raise_temp) = id(supplemental_diff);
+                auto call = id(blower_fan).turn_off();
+                call.set_speed(0);
+                call.perform();
+                id(current_fan) = 0;
+              }
+              else 
+              {
+                id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature);
+                if (id(diff) > id(fan_raise_temp))
+                {
+                  if (id(current_fan) < 81)
+                  {
+                    id(fan_raise_temp) += ${fan_hysteresis} * 2;
+                    id(fan_lower_temp) += ${fan_hysteresis} * 2;
+                    if (id(fan_raise_temp) > 9.6)
+                    {
+                      id(fan_raise_temp) = 9.6;
+                      id(fan_lower_temp)  = 9.3;
+                    }
+                    id(current_fan) += 20; //Increase fan speed
+                  }
+                  else
+                    id(current_fan) = 100; //Increase fan speed
+                  auto call = id(blower_fan).make_call();
+                  call.set_speed(id(current_fan));
+                  call.perform();
+                }
+                if (id(diff) < id(fan_lower_temp))
+                {
+                  if (id(climate_action) == 2 && id(diff) < ${supplemental_cooling_diff}); //if A/C on and difference is smaller turn off fast compressor speed
+                    id(supplemental_enabled).turn_off(); 
+                  if (id(current_fan) > 19)
+                  {
+                    id(fan_lower_temp) -= ${fan_hysteresis} * 2;
+                    id(fan_raise_temp) -= ${fan_hysteresis} * 2;
+                    if (id(fan_lower_temp) < 2.0)
+                    {
+                      id(fan_lower_temp) = id(supplemental_diff)- ${fan_hysteresis};
+                      id(fan_raise_temp) = id(supplemental_diff);
+                    }
+                    id(current_fan) -= 20; //Decrease fan speed
+                  }
+                  else
+                    id(current_fan) = 0; //Decrease fan speed
+                  auto call = id(blower_fan).make_call();
+                  call.set_speed(id(current_fan));
+                  call.perform();
+                }
+                //otherwise leave fan speed the same
+              }
             }
-            else if ( id(this_thermostat).current_temperature > id(this_thermostat).target_temperature +3 ) {
-              auto call = id(blower_fan).make_call();
-              call.set_speed(80);
+          }
+          else if (id(this_thermostat).fan_mode == CLIMATE_FAN_LOW)
+          {
+              id(current_fan) = 15;
+              auto call = id(blower_fan).turn_on();
+              call.set_speed(15);
               call.perform();
-            }
-            else if ( id(this_thermostat).current_temperature > id(this_thermostat).target_temperature +2.5 ) {
-              auto call = id(blower_fan).make_call();
-              call.set_speed(60);
-              call.perform();
-            }
-            else if ( id(this_thermostat).current_temperature > id(this_thermostat).target_temperature +1 ) {
-              auto call = id(blower_fan).make_call();
+          }
+          else if (id(this_thermostat).fan_mode == CLIMATE_FAN_MEDIUM)
+          {
+              id(current_fan) = 40;
+              auto call = id(blower_fan).turn_on();
               call.set_speed(40);
               call.perform();
-            }
-            else if ( id(this_thermostat).current_temperature > id(this_thermostat).target_temperature +0.5 ) {
-              auto call = id(blower_fan).make_call();
-              call.set_speed(20);
-              call.perform();
-            }
-            else {
-              auto call = id(blower_fan).make_call();
-              call.set_speed(0);
-              call.perform();          
-            }
           }
-          if (id(this_thermostat).fan_mode == CLIMATE_FAN_LOW){
-              auto call = id(blower_fan).make_call();
-              call.set_speed(0);
-              call.perform();
-          }
-          if (id(this_thermostat).fan_mode == CLIMATE_FAN_MEDIUM){
-              auto call = id(blower_fan).make_call();
-              call.set_speed(50);
-              call.perform();
-          }
-          if (id(this_thermostat).fan_mode == CLIMATE_FAN_HIGH){
-              auto call = id(blower_fan).make_call();
+          else if (id(this_thermostat).fan_mode == CLIMATE_FAN_HIGH)
+          {
+              id(current_fan) = 100;
+              auto call = id(blower_fan).turn_on();
               call.set_speed(100);
               call.perform();
           }
-      - lambda: id(fan_speed_diagnostic).publish_state(id(blower_fan).speed);
-      
+          else  //should not get here!!!
+          {
+            auto call = id(blower_fan).turn_off();
+            call.set_speed(100);  //Have fan full blast to protect compressor
+            call.perform();
+            id(current_fan) = 100;
+          }
+          
+      - logger.log:
+          format: "Update fan speed script - calling fan_speed_diagnostic script"
+      - lambda: |-
+          if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO && (id(blower_fan).state)) 
+          {
+             id(fan_speed_diagnostic).publish_state(id(blower_fan).speed);
+          }
+      - logger.log:
+          format: "Exited update_fan_speed, fan_raise_temp %.1f, fan_lower_temp %.1f, \ncurrent_temperature %1f, target_temperature %1f, diff %1f"
+          args: [ 'id(fan_raise_temp)','id(fan_lower_temp)', 'id(this_thermostat).current_temperature', 'id(this_thermostat).target_temperature', 'id(diff)' ]      
 
   # Update the Status Light
   - id: status_light_update
@@ -400,14 +840,14 @@ script:
       # CLIMATE OFF - ORANGE
       - if:
           condition:
-            lambda: 'return id(this_thermostat).mode == CLIMATE_MODE_OFF;'
+            lambda: 'return id(this_thermostat).action == CLIMATE_ACTION_OFF;'
           then:
             - light.turn_on:
                 id: statusledlight
                 red: 50%
                 green: 35%
                 blue: 0%
-                brightness: 30%
+                brightness: 10%
                 effect: "None"
       # CLIMATE IDLE - FAINT BLUE
       - if:
@@ -435,7 +875,7 @@ script:
                       red: 0%
                       green: 0%
                       blue: 100%
-                      brightness: 40%
+                      brightness: 20%
                       effect: "Pulse Fast"
                 else:
                   - light.turn_on: 
@@ -443,18 +883,42 @@ script:
                       red: 0%
                       green: 0%
                       blue: 100%
-                      brightness: 40%
+                      brightness: 20%
                       effect: "Pulse"
+      # CLIMATE HEAT - PULSING RED
+      - if:
+          condition:
+            lambda: 'return id(this_thermostat).action == CLIMATE_ACTION_HEATING;'
+          then:
+            - light.turn_on: 
+                id: statusledlight
+                red: 100%
+                green: 0%
+                blue: 0%
+                brightness: 20%
+                effect: "Pulse"            
       # CLIMATE FAN ONLY MODE - PULSING CYAN
       - if:
           condition:
-            lambda: 'return id(this_thermostat).mode == CLIMATE_MODE_FAN_ONLY;'
+            lambda: 'return id(this_thermostat).action == CLIMATE_ACTION_FAN;'
           then:
             - light.turn_on: 
                 id: statusledlight
                 red: 0%
                 green: 100%
                 blue: 100%
-                brightness: 40%
+                brightness: 20%
                 effect: "Pulse"            
 
+## Run temp sensors every minute (minimize heating, prevent failures with some sensors)...
+##   This is debugged but should only be used if there are sensor lock up issues
+##   due to the fact that silicon lasts longer when not power cycled (device is buried in the floor
+##   and not easily replacable), to use must also uncomment update_interval: never in sensor floor_temp
+#interval:
+#  - interval: 60s
+#    then:
+#      - switch.turn_on: one_wire_sw
+#      - delay: 2s
+#      - component.update: floor_temp
+#      - delay: 1s
+#      - switch.turn_off: one_wire_sw
