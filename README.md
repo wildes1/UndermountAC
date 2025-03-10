@@ -19,4 +19,4 @@ Note that the ESPHome thermostat will need to be modified (involves soldering) f
 
 For heat, the LED now pulsates Red, that can be customized by changing the code at the end of the file.  
 
-Questions, comments, improvements?  Please post an issue using the link above.
+Questions, comments, improvements?  Please post in discussions using the link above.
