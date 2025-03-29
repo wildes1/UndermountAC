@@ -9,7 +9,7 @@ Please visit: [https://mikegoubeaux.github.io/UndermountAC](https://mikegoubeaux
 
 The specific UndermountAC hardware used in this system is the 12V ducted evaporator system [https://undermountac.com/collections/hvac-ducted/products/12vacducted](https://undermountac.com/collections/hvac-ducted/products/12vacducted) and the Heat addition module with 4 way valve [https://undermountac.com/collections/heat-controls/products/heat-addition-module-relay-module-4-way-valve](https://undermountac.com/collections/heat-controls/products/heat-addition-module-relay-module-4-way-valve) and the ESPHome thermostat controller [https://undermountac.com/collections/thermostats/products/esphome-thermostat-controller-12-30v-dc](https://undermountac.com/collections/thermostats/products/esphome-thermostat-controller-12-30v-dc).
 
-The NextGen thermostat will not be used, it will be replaced by the ESPHome thermostat controller (I ordered it with the system along with heat capable option linked above).  However, the RS-485 cable from the thermostat will be used (see below).  
+The NextGen thermostat is not used, it is replaced by the ESPHome thermostat controller (I ordered it with the system along with heat capable option linked above).  However, the RS-485 cable from the thermostat is used (see below).  
 
 The Heat addition module is used for all heating system relays due to system configuration and the need for three relays as only two extra are available on the ESPHome thermostat.  One relay controls the 4 way valve, the second controls the Espar boiler which also controls the main circulator pump (dry contact, closed for calling for heat) and the third controls the floor circulator pump (12V).
 
