@@ -9,7 +9,11 @@ Please visit: [https://mikegoubeaux.github.io/UndermountAC](https://mikegoubeaux
 
 The specific UndermountAC hardware used in this system is the 12V ducted evaporator system [https://undermountac.com/collections/hvac-ducted/products/12vacducted](https://undermountac.com/collections/hvac-ducted/products/12vacducted) and the Heat addition module with 4 way valve [https://undermountac.com/collections/heat-controls/products/heat-addition-module-relay-module-4-way-valve](https://undermountac.com/collections/heat-controls/products/heat-addition-module-relay-module-4-way-valve) and the ESPHome thermostat controller [https://undermountac.com/collections/thermostats/products/esphome-thermostat-controller-12-30v-dc](https://undermountac.com/collections/thermostats/products/esphome-thermostat-controller-12-30v-dc).
 
+The NextGen thermostat will not be used, it will be replaced by the ESPHome thermostat controller (I ordered it with the system along with heat capable option linked above).  However, the RS-485 cable from the thermostat will be used (see below).  
+
 The Heat addition module is used for all heating system relays due to system configuration and the need for three relays as only two extra are available on the ESPHome thermostat.  One relay controls the 4 way valve, the second controls the Espar boiler which also controls the main circulator pump (dry contact, closed for calling for heat) and the third controls the floor circulator pump (12V).
+
+The Heat addition module connects to the ESPHome thermostat controller RS-485 port with the cable provided with the heat capable NextGen thermostat.  Disassemble the thermostat and remove the cable from the connector and the back of the thermostat (there is a grommet that the cable goes through that can be removed to get the connector through).
 
 The floor temp sensor used is a One Wire (Dallas DS18B20).  It was installed in the floor alongside the NTC thermistor that the radiant heat system kit provided.  The One Wire device was selected as it was on-hand and known good.  An SHT3xx device can also be used, however it will need a separate I2C bus unless one with a different I2C address (chip select) can be procured.  
 
