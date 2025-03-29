@@ -1,5 +1,6 @@
 ##  030925 - First public release
 ##  030925 - Fixed bug that caused fan speed to be at 100%
+##  032925 - Use proper target_temperature for heating vs cooling
 
 ##  ToDo - Tekmar T-stat 50% duty cycle is 20 min on, 20 min off, when temp is -1.5 to +1.5 degree of setpoint as follows:
 ##         100% on time at Heat To setting -1.5°F
@@ -545,7 +546,9 @@ climate:
     id: this_thermostat
     sensor: onboard_temperature
     visual:
-      temperature_step: 0.5
+      temperature_step:
+        target_temperature: 1
+        current_temperature: 0.1
       min_temperature: 39.9999999 °F  #40 °F gave errors when clicking "-" from 41 to 40
       max_temperature: 100.00001 °F   #assume 100 will do the same as above
 
@@ -740,7 +743,17 @@ script:
       - lambda: |-
           if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO)
           { 
-            id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature);
+            if (id(this_thermostat).action == CLIMATE_ACTION_HEATING)
+              id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_low);
+            else if (id(this_thermostat).action == CLIMATE_ACTION_COOLING)
+              id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_high);
+            else //handles idle or other unexpected states
+            {
+              if (fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_high) < fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_low))
+                id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_high);
+              else
+                id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_low);
+            }
             if(id(blower_fan).state)  //If fan is on 
             {
               if ( id(climate_action) == 0)
@@ -836,8 +849,8 @@ script:
              id(fan_speed_diagnostic).publish_state(id(blower_fan).speed);
           }
       - logger.log:
-          format: "Exited update_fan_speed, fan_raise_temp %.1f, fan_lower_temp %.1f, \ncurrent_temperature %1f, target_temperature %1f, diff %1f"
-          args: [ 'id(fan_raise_temp)','id(fan_lower_temp)', 'id(this_thermostat).current_temperature', 'id(this_thermostat).target_temperature', 'id(diff)' ]      
+          format: "Exited update_fan_speed, fan_raise_temp %.1f, fan_lower_temp %.1f, climate_action %1d, \ncurrent_temperature %1f, target_temperature_high %1f, target_temperature_low %1f, diff %1f"
+          args: [ 'id(fan_raise_temp)','id(fan_lower_temp)', 'id(climate_action)', 'id(this_thermostat).current_temperature', 'id(this_thermostat).target_temperature_high', 'id(this_thermostat).target_temperature_low', 'id(diff)' ]      
 
   # Update the Status Light
   - id: status_light_update
