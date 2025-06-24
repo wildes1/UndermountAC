@@ -1,6 +1,9 @@
 ##  030925 - First public release
 ##  030925 - Fixed bug that caused fan speed to be at 100%
 ##  032925 - Use proper target_temperature for heating vs cooling
+##  033125 - Correct floor temp limit, it uses deg C, not deg F
+##  062425 - Commented out supplemental_enabled logic in fan script, need to re-think logic as it permanently disables second stage
+##           Added second_stage_enable to substitutions
 
 ##  ToDo - Tekmar T-stat 50% duty cycle is 20 min on, 20 min off, when temp is -1.5 to +1.5 degree of setpoint as follows:
 ##         100% on time at Heat To setting -1.5°F
@@ -29,8 +32,9 @@ substitutions:
   
   # Constants for climate and fan staging setup, works for both yaml and lambda (sort of like #define in C)
   fan_hysteresis: "0.4"
-  supplemental_cooling_diff: "2.4"
+  supplemental_cooling_diff: "1.4"
   supplemental_heating_diff: "1.4"
+  second_stage_enable: "30 min"
 
   #One Wire temp sensor address and GPIO
   one_wire_address: "0x13011312B96FAA28"
@@ -114,10 +118,10 @@ globals:
     restore_value: no
     initial_value: "25"
 
-  - id: floor_temp_limit  #floor temp limit when the floor pump should be turned off (90F)
+  - id: floor_temp_limit  #floor temp limit when the floor pump should be turned off in deg C (90F)
     type: float
     restore_value: no
-    initial_value: "90"
+    initial_value: "32.2"
 
   # This is set to either supplemental_heating_diff or supplemental_cooling_diff depending on action
   - id: supplemental_diff
@@ -443,7 +447,7 @@ switch:
           payload.push_back(0x00); // OFF
           id(floor_pump).publish_state(false);
         }
-        else if (id(floor_temp_value) < id(floor_temp_limit)-4) //Turn on if under floor temp limit - 4 degrees F
+        else if (id(floor_temp_value) < id(floor_temp_limit)-4) //Turn on if under floor temp limit - 4 degrees C
         {
           payload.push_back(0xff); // ON
           id(floor_pump).publish_state(true);
@@ -656,9 +660,9 @@ climate:
       - logger.log:
           format: "Called off_mode"
     
-    # turn the compressor to HIGH under these conditions, was 30 min and 5C:
+    # turn the compressor to HIGH under these conditions, was 10 min and $supplemental_cooling_diff:
     set_point_minimum_differential: 0.25
-    max_cooling_run_time: 30min 
+    max_cooling_run_time: ${second_stage_enable} 
     supplemental_cooling_delta: ${supplemental_cooling_diff} # when the delta between target temp and current temp is > than this value (appears to only work in °C)
     supplemental_cooling_action:
       - if:
@@ -788,8 +792,8 @@ script:
                 }
                 else if (id(diff) < id(fan_lower_temp))
                 {
-                  if (id(climate_action) == 2 && id(diff) < ${supplemental_cooling_diff}); //if A/C on and difference is smaller turn off fast compressor speed
-                    id(supplemental_enabled).turn_off(); 
+                  //if (id(climate_action) == 2 && id(diff) < ${supplemental_cooling_diff}); //if A/C on and difference is smaller turn off fast compressor speed
+                  //  id(supplemental_enabled).turn_off(); 
                   if (id(current_fan) > 19)
                   {
                     id(fan_lower_temp) -= ${fan_hysteresis} * 2;
