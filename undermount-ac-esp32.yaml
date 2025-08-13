@@ -3,7 +3,8 @@
 ##  032925 - Use proper target_temperature for heating vs cooling
 ##  033125 - Correct floor temp limit, it uses deg C, not deg F
 ##  062425 - Commented out supplemental_enabled logic in fan script, need to re-think logic as it permanently disables second stage
-##           Added second_stage_enable to substitutions
+##           Added second_stage_enable to substitutions 
+##  081325 - Added logic to keep fan from speeding up once cool/heat demand is satisfied
 
 ##  ToDo - Tekmar T-stat 50% duty cycle is 20 min on, 20 min off, when temp is -1.5 to +1.5 degree of setpoint as follows:
 ##         100% on time at Heat To setting -1.5°F
@@ -747,16 +748,17 @@ script:
       - lambda: |-
           if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO)
           { 
-            if (id(this_thermostat).action == CLIMATE_ACTION_HEATING)
+            if (id(this_thermostat).action == CLIMATE_ACTION_HEATING && id(this_thermostat).current_temperature < id(this_thermostat).target_temperature_low)
               id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_low);
-            else if (id(this_thermostat).action == CLIMATE_ACTION_COOLING)
+            else if (id(this_thermostat).action == CLIMATE_ACTION_COOLING && id(this_thermostat).current_temperature > id(this_thermostat).target_temperature_high)
               id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_high);
             else //handles idle or other unexpected states
             {
-              if (fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_high) < fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_low))
-                id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_high);
-              else
-                id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_low);
+              id(diff) = 0.;  //Try setting diff to 0 here, we should not be actively heating or cooling at this time, or we have overcooled or overheated due to min run time
+              //if (fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_high) < fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_low))
+              //  id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_high);
+              //else
+              //  id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_low);
             }
             if(id(blower_fan).state)  //If fan is on 
             {
