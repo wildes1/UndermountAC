@@ -5,7 +5,12 @@
 ##  062425 - Commented out supplemental_enabled logic in fan script, need to re-think logic as it permanently disables second stage
 ##           Added second_stage_enable to substitutions 
 ##  081325 - Added logic to keep fan from speeding up once cool/heat demand is satisfied
-
+##  081425 - Changed supplemental logic to start out with no supplemental
+##  081725 - Added logic to enable supplemental when supplemental diff reached and disable 0.25C below supplemental diff
+##  100325 - Added control for new A/C power relay, power to this A/C controller ESP32 must be separated!!
+##           also added evaporator in and out temperatures, passenger and driver side temperatures and boiler supply temperature
+##           used the median of onboard, driver side and pass side temperature sensors for controlling climate
+##
 ##  ToDo - Tekmar T-stat 50% duty cycle is 20 min on, 20 min off, when temp is -1.5 to +1.5 degree of setpoint as follows:
 ##         100% on time at Heat To setting -1.5°F
 ##         50% on time at Heat To setting
@@ -33,12 +38,17 @@ substitutions:
   
   # Constants for climate and fan staging setup, works for both yaml and lambda (sort of like #define in C)
   fan_hysteresis: "0.4"
-  supplemental_cooling_diff: "1.4"
+  supplemental_cooling_diff: "2.0"
   supplemental_heating_diff: "1.4"
-  second_stage_enable: "30 min"
+  second_stage_enable: "50 min"
 
   #One Wire temp sensor address and GPIO
-  one_wire_address: "0x13011312B96FAA28"
+  one_wire_address:  "0x13011312B96FAA28"
+  one_wire2_address: "0x2df941c335646128"
+  one_wire3_address: "0xef5a85c335646128"
+  one_wire4_address: "0x395900c035646128"
+  one_wire5_address: "0x1e8109c035646128"
+  one_wire6_address: "0x5c6d47c235646128"
   one_wire_gpio: "GPIO12"
 
 esphome:
@@ -114,7 +124,57 @@ globals:
     restore_value: no
     initial_value: "25"
 
+  - id: last_evap_1  #last valid (under 84.0C) evap 1 temp measured
+    type: float
+    restore_value: no
+    initial_value: "25"
+
+  - id: last_evap_2  #last valid (under 84.0C) evap 2 temp measured
+    type: float
+    restore_value: no
+    initial_value: "25"
+
+  - id: last_driver_cabin  #last valid (under 84.0C) evap 2 temp measured
+    type: float
+    restore_value: no
+    initial_value: "25"
+
+  - id: last_pass_cabin  #last valid (under 84.0C) evap 2 temp measured
+    type: float
+    restore_value: no
+    initial_value: "25"
+
+  - id: last_boiler_supply  #last valid (under 84.0C) evap 2 temp measured
+    type: float
+    restore_value: no
+    initial_value: "25"
+
   - id: floor_temp_value  #floor temp measured for lambdas
+    type: float
+    restore_value: no
+    initial_value: "25"
+
+  - id: evap_1_temp_value  #evap_1 temp measured for lambdas
+    type: float
+    restore_value: no
+    initial_value: "25"
+
+  - id: evap_2_temp_value  #evap_2 temp measured for lambdas
+    type: float
+    restore_value: no
+    initial_value: "25"
+
+  - id: driver_cabin_temp_value  #temp measured for lambdas
+    type: float
+    restore_value: no
+    initial_value: "25"
+
+  - id: pass_cabin_temp_value  #temp measured for lambdas
+    type: float
+    restore_value: no
+    initial_value: "25"
+
+  - id: boiler_supply_temp_value  #temp measured for lambdas
     type: float
     restore_value: no
     initial_value: "25"
@@ -300,6 +360,86 @@ sensor:
     unit_of_measurement: "°F"    
     #update_interval: never
 
+  - platform: dallas_temp
+    address: ${one_wire2_address}
+    id: evap_temp_1
+    name: "Evap In Temperature"
+    filters:
+      # One Wire sensor occasionally reads 85C (all 1's), report last temp measured when it does this
+    - lambda: |-
+        if (x > 84.0)
+          x =  id(last_evap_1);
+        else
+          id(last_evap_1) = x;
+        id(evap_1_temp_value) = x; //store for other lambdas  
+        return x * (9.0/5.0) + 32.0;
+    unit_of_measurement: "°F"    
+    #update_interval: never
+
+  - platform: dallas_temp
+    address: ${one_wire3_address}
+    id: evap_temp_2
+    name: "Evap Out Temperature"
+    filters:
+      # One Wire sensor occasionally reads 85C (all 1's), report last temp measured when it does this
+    - lambda: |-
+        if (x > 84.0)
+          x =  id(last_evap_2);
+        else
+          id(last_evap_2) = x;
+        id(evap_2_temp_value) = x; //store for other lambdas  
+        return x * (9.0/5.0) + 32.0;
+    unit_of_measurement: "°F"    
+    #update_interval: never
+
+  - platform: dallas_temp
+    address: ${one_wire4_address}
+    id: dr_temp
+    name: "Driver Side Cabin Temperature"
+    filters:
+      # One Wire sensor occasionally reads 85C (all 1's), report last temp measured when it does this
+    - lambda: |-
+        if (x > 84.0)
+          x =  id(last_driver_cabin);
+        else
+          id(last_driver_cabin) = x;
+        id(driver_cabin_temp_value) = x; //store for other lambdas  
+        return x;   // * (9.0/5.0) + 32.0;
+    unit_of_measurement: "°C"    
+    #update_interval: never
+
+  - platform: dallas_temp
+    address: ${one_wire5_address}
+    id: pass_temp
+    name: "Passenger Side Cabin Temperature"
+    filters:
+      # One Wire sensor occasionally reads 85C (all 1's), report last temp measured when it does this
+    - lambda: |-
+        if (x > 84.0)
+          x =  id(last_pass_cabin);
+        else
+          id(last_pass_cabin) = x;
+        id(pass_cabin_temp_value) = x; //store for other lambdas  
+        return x;   // * (9.0/5.0) + 32.0;
+    unit_of_measurement: "°C"    
+    #update_interval: never
+
+  - platform: dallas_temp
+    address: ${one_wire6_address}
+    id: boiler_supply_temp
+    name: "Boiler Supply Temperature"
+    filters:
+      # One Wire sensor occasionally reads 85C (all 1's), report last temp measured when it does this
+    - lambda: |-
+        if (x > 84.0)
+          x =  id(last_boiler_supply);
+        else
+          id(last_boiler_supply) = x;
+        id(boiler_supply_temp_value) = x; //store for other lambdas  
+        return x * (9.0/5.0) + 32.0;
+    unit_of_measurement: "°F"    
+    #update_interval: never
+
   # onboard SHT30 temp/humidity sensor
   - platform: sht3xd
     i2c_id: bus_a
@@ -312,6 +452,15 @@ sensor:
       id: onboard_humidity
     update_interval: 30s
 
+  - platform: combination
+    type: median
+    sources:
+      - source: onboard_temperature
+      - source: dr_temp
+      - source: pass_temp
+    name: "Median Cabin Temperature"
+    id: median_cabin_temp
+    
   # fan speed diagnostics sensor
   - platform: template
     id: fan_speed_diagnostic
@@ -549,7 +698,7 @@ climate:
   - platform: thermostat
     name: "Thermostat"
     id: this_thermostat
-    sensor: onboard_temperature
+    sensor: median_cabin_temp
     visual:
       temperature_step:
         target_temperature: 1
@@ -559,8 +708,8 @@ climate:
 
     # these are the recommended values from UndermountAC
     # recommended values cycled too much, using 6 cycles per hour
-    min_cooling_off_time: 3min # should be no less than "2min"
-    min_cooling_run_time: 7min # should be no less than "2min" to avoid short cycling
+    min_cooling_off_time: 5min # should be no less than "2min"
+    min_cooling_run_time: 5min # should be no less than "2min" to avoid short cycling
     min_idle_time: 120s # necessary for heat/cool with auto changeover
     min_heating_off_time: 3min
     min_heating_run_time: 7min
@@ -579,6 +728,10 @@ climate:
       - lambda: id(blower_pwm).set_min_power(0.15);
       - lambda: id(blower_pwm).set_max_power(0.65); //Heat coil does not need a great deal of airflow
       - switch.turn_off: air_cond
+      - delay: 1s
+      - homeassistant.action:
+          action: script.uac_on
+      - delay: 2s
       - lambda: id(floor_pump_state) = 1; //Set state to on for floor pump
       - switch.turn_on: floor_pump
       - lambda: id(diesel_burner_state) = 1; //Set state to on for diesel burner
@@ -591,6 +744,7 @@ climate:
       - logger.log:
           format: "Called heat_action"
     cool_action:
+      - lambda: id(supplemental_enabled).turn_off(); //Make sure we start with supplemental off
       # set min and max fan speeds for normal operation - to protect equipment
       - lambda: id(blower_pwm).set_min_power(0.40); 
       - lambda: id(blower_pwm).set_max_power(0.98);
@@ -600,6 +754,11 @@ climate:
       - switch.turn_off: diesel_burner
       - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
       - switch.turn_on: heat_coil_bypass
+      - switch.turn_off: compressor_speed_high
+      - delay: 1s
+      - homeassistant.action:
+          action: script.uac_on
+      - delay: 2s
       - switch.turn_on: air_cond
       - delay: 20s
       - fan.turn_on: blower_fan
@@ -621,6 +780,10 @@ climate:
       - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
       - switch.turn_off: floor_pump
       - fan.turn_off: blower_fan
+      - delay: 5.0s #delay more for fan coast-down
+      - homeassistant.action:
+          action: script.uac_off
+      - delay: 1s
       - lambda: id(climate_action) = 4;
       - logger.log:
           format: "Called idle_action"
@@ -633,6 +796,10 @@ climate:
       - switch.turn_on: heat_coil_bypass
       - switch.turn_off: air_cond
       - switch.turn_off: compressor_speed_high
+      - delay: 1s
+      - homeassistant.action:
+          action: script.uac_on
+      - delay: 2s
       # set min and max fan speeds to wider range
       - lambda: id(blower_pwm).set_min_power(0.15);
       - lambda: id(blower_pwm).set_max_power(0.98);
@@ -657,6 +824,10 @@ climate:
       # set min and max fan speeds to full range - in case fan is used by itself
       - lambda: id(blower_pwm).set_min_power(0.15);
       - lambda: id(blower_pwm).set_max_power(0.98);
+      - delay: 5.0s #delay more for fan coast-down
+      - homeassistant.action:
+          action: script.uac_off
+      - delay: 1s
       - lambda: id(climate_action) = 0;
       - logger.log:
           format: "Called off_mode"
@@ -775,6 +946,8 @@ script:
               {
                 if (id(diff) > id(fan_raise_temp))
                 {
+                  if (id(climate_action) == 2 && id(diff) > ${supplemental_cooling_diff}); //if A/C on and difference is larger turn on fast compressor speed
+                    id(supplemental_enabled).turn_on(); 
                   if (id(current_fan) < 81)
                   {
                     id(fan_raise_temp) += ${fan_hysteresis} * 2;
@@ -794,8 +967,8 @@ script:
                 }
                 else if (id(diff) < id(fan_lower_temp))
                 {
-                  //if (id(climate_action) == 2 && id(diff) < ${supplemental_cooling_diff}); //if A/C on and difference is smaller turn off fast compressor speed
-                  //  id(supplemental_enabled).turn_off(); 
+                  if (id(climate_action) == 2 && id(diff) < ${supplemental_cooling_diff}-0.25); //if A/C on and difference is smaller turn off fast compressor speed
+                    id(supplemental_enabled).turn_off(); 
                   if (id(current_fan) > 19)
                   {
                     id(fan_lower_temp) -= ${fan_hysteresis} * 2;
