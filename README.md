@@ -23,4 +23,16 @@ Note that the ESPHome thermostat will need to be modified (involves soldering) f
 
 For heat, the LED now pulsates Red, that can be customized by changing the code at the end of the file.  
 
+10/4/2025 - these changes are even more specific to my installation than the rest of this project:
+
+A new relay (controlled through Home Assistant) has been set up to interrupt power to the compressor (used as a workaround to false overvoltage events the compressor control board is giving me).
+
+Two temparature sensors were added to the existing onboard_temperature sensor and the median of the three used for temperature control.
+
+Evaporater in and out temperatures are now measured.  Future use will be to allow better control of the blower speed while preventing freeze-up.
+
+A boiler supply temperature sensor was also added.
+
+All of the new temperature sensors are onw-wire sensors.
+
 Questions, comments, improvements?  Please post in discussions using the link above.
