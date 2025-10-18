@@ -10,6 +10,8 @@
 ##  100325 - Added control for new A/C power relay, power to this A/C controller ESP32 must be separated!!
 ##           also added evaporator in and out temperatures, passenger and driver side temperatures and boiler supply temperature
 ##           used the median of onboard, driver side and pass side temperature sensors for controlling climate
+##  101825 - Changed platform to esp-idf, also had to change neopixelbus to esp32_rmt_led_strip
+##           Changed uac_off delay from 5 to 10 seconds to insure blower coast-down
 ##
 ##  ToDo - Tekmar T-stat 50% duty cycle is 20 min on, 20 min off, when temp is -1.5 to +1.5 degree of setpoint as follows:
 ##         100% on time at Heat To setting -1.5°F
@@ -67,7 +69,8 @@ esphome:
 esp32:
   board: esp32-s3-devkitc-1
   framework:
-    type: arduino
+    # type: arduino #cannot change to     
+    type: esp-idf #as neopixelbus net ported yet
 
 # To be able to get logs from the device via serial and api.
 logger:
@@ -262,8 +265,11 @@ light:
     output: statusoutput
   
   # ESP32-S3 onboard RGB LED
-  - platform: neopixelbus
-    variant: WS2812
+  # - platform: neopixelbus #esp32_rmt_led_strip
+  #   variant: WS2812
+  - platform: esp32_rmt_led_strip #variant not supported, also ...order is a required ooption
+    chipset: WS2812
+    rgb_order: RGB
     pin: 48
     num_leds: 1
     name: "Status LED RGB"
@@ -780,7 +786,7 @@ climate:
       - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
       - switch.turn_off: floor_pump
       - fan.turn_off: blower_fan
-      - delay: 5.0s #delay more for fan coast-down
+      - delay: 10.0s #delay 10 seconds for fan coast-down
       - homeassistant.action:
           action: script.uac_off
       - delay: 1s
@@ -824,7 +830,7 @@ climate:
       # set min and max fan speeds to full range - in case fan is used by itself
       - lambda: id(blower_pwm).set_min_power(0.15);
       - lambda: id(blower_pwm).set_max_power(0.98);
-      - delay: 5.0s #delay more for fan coast-down
+      - delay: 10.0s #delay 10 seconds for fan coast-down
       - homeassistant.action:
           action: script.uac_off
       - delay: 1s
