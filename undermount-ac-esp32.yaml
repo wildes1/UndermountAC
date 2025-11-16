@@ -12,6 +12,8 @@
 ##           used the median of onboard, driver side and pass side temperature sensors for controlling climate
 ##  101825 - Changed platform to esp-idf, also had to change neopixelbus to esp32_rmt_led_strip
 ##           Changed uac_off delay from 5 to 10 seconds to insure blower coast-down
+##  111525 - Added minimum  of onboard, driver side and pass side temperature sensors for controlling climate
+##           as radiant heating from outside generally only occurs either side, not both
 ##
 ##  ToDo - Tekmar T-stat 50% duty cycle is 20 min on, 20 min off, when temp is -1.5 to +1.5 degree of setpoint as follows:
 ##         100% on time at Heat To setting -1.5°F
@@ -467,6 +469,15 @@ sensor:
     name: "Median Cabin Temperature"
     id: median_cabin_temp
     
+  - platform: combination
+    type: min
+    sources:
+      - source: onboard_temperature
+      - source: dr_temp
+      - source: pass_temp
+    name: "Minimum Cabin Temperature"
+    id: minimum_cabin_temp
+    
   # fan speed diagnostics sensor
   - platform: template
     id: fan_speed_diagnostic
@@ -704,7 +715,7 @@ climate:
   - platform: thermostat
     name: "Thermostat"
     id: this_thermostat
-    sensor: median_cabin_temp
+    sensor: minimum_cabin_temp
     visual:
       temperature_step:
         target_temperature: 1
