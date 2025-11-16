@@ -14,6 +14,7 @@
 ##           Changed uac_off delay from 5 to 10 seconds to insure blower coast-down
 ##  111525 - Added minimum  of onboard, driver side and pass side temperature sensors for controlling climate
 ##           as radiant heating from outside generally only occurs either side, not both
+##  111625 - Added second_stage_heat_enable and set to 90 min to keep fan-forced heat from coming on unless temp exceeds supplemental_heating_diff
 ##
 ##  ToDo - Tekmar T-stat 50% duty cycle is 20 min on, 20 min off, when temp is -1.5 to +1.5 degree of setpoint as follows:
 ##         100% on time at Heat To setting -1.5°F
@@ -44,7 +45,8 @@ substitutions:
   fan_hysteresis: "0.4"
   supplemental_cooling_diff: "2.0"
   supplemental_heating_diff: "1.4"
-  second_stage_enable: "50 min"
+  second_stage_cool_enable: "50 min"
+  second_stage_heat_enable: "90 min"
 
   #One Wire temp sensor address and GPIO
   one_wire_address:  "0x13011312B96FAA28"
@@ -195,11 +197,13 @@ globals:
     restore_value: no
     initial_value: "1.2"
 
+  # This is set to either supplemental_heating_diff or supplemental_cooling_diff + fan_hysteresis depending on action
   - id: fan_raise_temp  #temp diff to raise fan speed
     type: float
     restore_value: no
     initial_value: "0.4"
 
+  # This is set to either supplemental_heating_diff or supplemental_cooling_diff - fan_hysteresis depending on action
   - id: fan_lower_temp  #temp diff to lower fan speed
     type: float
     restore_value: no
@@ -851,7 +855,7 @@ climate:
     
     # turn the compressor to HIGH under these conditions, was 10 min and $supplemental_cooling_diff:
     set_point_minimum_differential: 0.25
-    max_cooling_run_time: ${second_stage_enable} 
+    max_cooling_run_time: ${second_stage_cool_enable} 
     supplemental_cooling_delta: ${supplemental_cooling_diff} # when the delta between target temp and current temp is > than this value (appears to only work in °C)
     supplemental_cooling_action:
       - if:
@@ -861,7 +865,7 @@ climate:
             - switch.turn_on: compressor_speed_high
       - lambda: id(supplemental_diff) = ${supplemental_cooling_diff};
     # heat 1st stage no fan, 2nd stage fan, fan speed determined by delta t in update_fan_speed script        
-    max_heating_run_time: 30min 
+    max_heating_run_time: ${second_stage_heat_enable} 
     supplemental_heating_delta: ${supplemental_heating_diff} # when the delta between target temp and current temp is > than this value (appears to only work in °C)
     supplemental_heating_action:
       - logger.log:
@@ -921,7 +925,7 @@ climate:
     # when any state change occurs on the Thermostat
     on_state:
       - logger.log:
-          format: "Called on_state line 833"
+          format: "Called on_state line 924"
       - script.execute: update_fan_speed
       - script.execute: status_light_update
 
