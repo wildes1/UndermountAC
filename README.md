@@ -33,6 +33,8 @@ Evaporater in and out temperatures are now measured.  Future use will be to allo
 
 A boiler supply temperature sensor was also added.
 
-All of the new temperature sensors are onw-wire sensors.
+All of the new temperature sensors are one-wire sensors.
+
+Selection of cabin temperature sensors based on thermostat mode added to keep from overheating or over-cooling due to radiant heat effects from sensors on the sunny side
 
 Questions, comments, improvements?  Please post in discussions using the link above.
