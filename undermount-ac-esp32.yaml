@@ -15,6 +15,9 @@
 ##  111525 - Added minimum  of onboard, driver side and pass side temperature sensors for controlling climate
 ##           as radiant heating from outside generally only occurs either side, not both
 ##  111625 - Added second_stage_heat_enable and set to 90 min to keep fan-forced heat from coming on unless temp exceeds supplemental_heating_diff
+##  010825 - Desired, for now just switched climate to use max temp - Added maximum of onboard, driver side and pass side temperature sensors for controlling climate for winter as radiant cooling was affecting temp sensors
+##           also logic to select which to use based on heat mode (auto uses min)
+##  012125 - Implement desired sensor selection above, Mode COOL uses minimum cabin temperature so we don't overcool, all other modes use maximum (meaning mode AUTO will not overheat but will overcool)
 ##
 ##  ToDo - Tekmar T-stat 50% duty cycle is 20 min on, 20 min off, when temp is -1.5 to +1.5 degree of setpoint as follows:
 ##         100% on time at Heat To setting -1.5°F
@@ -46,7 +49,7 @@ substitutions:
   supplemental_cooling_diff: "2.0"
   supplemental_heating_diff: "1.4"
   second_stage_cool_enable: "50 min"
-  second_stage_heat_enable: "90 min"
+  second_stage_heat_enable: "500 min" # make long so hopefully it doesn't time out
 
   #One Wire temp sensor address and GPIO
   one_wire_address:  "0x13011312B96FAA28"
@@ -482,6 +485,25 @@ sensor:
     name: "Minimum Cabin Temperature"
     id: minimum_cabin_temp
     
+  - platform: combination
+    type: max
+    sources:
+      - source: onboard_temperature
+      - source: dr_temp
+      - source: pass_temp
+    name: "Maximum Cabin Temperature"
+    id: maximum_cabin_temp
+
+# Selects one of the above combination temperatures depending on thermostat mode
+  - platform: template
+    lambda: |-
+      if (id(this_thermostat).mode == CLIMATE_MODE_COOL)
+        return id(minimum_cabin_temp).state;
+      else  //Heating and auto
+        return id(maximum_cabin_temp).state;
+    name: "Selected Cabin Temperature"
+    id: selected_cabin_temp
+
   # fan speed diagnostics sensor
   - platform: template
     id: fan_speed_diagnostic
@@ -719,7 +741,7 @@ climate:
   - platform: thermostat
     name: "Thermostat"
     id: this_thermostat
-    sensor: minimum_cabin_temp
+    sensor: maximum_cabin_temp # minimum_cabin_temp #for summer
     visual:
       temperature_step:
         target_temperature: 1
@@ -886,10 +908,10 @@ climate:
     default_preset: Standby
     preset:
       - name: Home
-        default_target_temperature_high: 90 °F
-        default_target_temperature_low: 40 °F
+        default_target_temperature_high: 85 °F
+        default_target_temperature_low: 60 °F
         fan_mode: AUTO
-        mode: cool
+        mode: AUTO
       - name: Standby
         default_target_temperature_high: 90 °F
         default_target_temperature_low: 40 °F
@@ -899,7 +921,7 @@ climate:
         default_target_temperature_high: 90 °F
         default_target_temperature_low: 40 °F
         fan_mode: low
-        mode: cool
+        mode: AUTO
     
     # fan modes are available in the Climate card in HA Frontend and can be called with "climate.set_fan_mode" in automations
     # these speeds are mapped to the above clamped PWM output values so the fan will never go too low
