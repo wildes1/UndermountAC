@@ -37,4 +37,6 @@ All of the new temperature sensors are one-wire sensors.
 
 Selection of cabin temperature sensors based on thermostat mode added to keep from overheating or over-cooling due to radiant heat effects from sensors on the sunny side
 
+3/3/2026 - added first pass at duty cycle using slow_pwm to imitate Tekmar Thermostat "PWM" function.  No perfect as it does not start the 50% duty cycle until under the setpoint, have not tried negative deadband... 
+
 Questions, comments, improvements?  Please post in discussions using the link above.
