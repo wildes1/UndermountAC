@@ -19,9 +19,13 @@
 ##           also logic to select which to use based on heat mode (auto uses min)
 ##  012126 - Implement desired sensor selection above, Mode COOL uses minimum cabin temperature so we don't overcool, all other modes use maximum (meaning mode AUTO will not overheat but will overcool)
 ##  030226 - First pass at duty cycle using slow_pwm
+##  030326 - Continue to develop, rewrote floor temp limit to be active all the time and debugged fan speed issues
 ##
 ##
-##  ToDo - Tekmar T-stat 50% duty cycle is 20 min on, 20 min off, when temp is -1.5 to +1.5 degree of setpoint as follows:
+##    HVAC Enable slow_pwm switch: on enables slow PWM behavior similar to described below, off disables slow PWM, burner is on constantly when heat is called
+##
+##
+##    Tekmar T-stat 50% duty cycle is 20 min on, 20 min off, when temp is -1.5 to +1.5 degree of setpoint as follows:
 ##         100% on time at Heat To setting -1.5°F
 ##         50% on time at Heat To setting
 ##         0% on time at Heat To setting + 1.5°F
@@ -93,7 +97,7 @@ esp32:
 
 # To be able to get logs from the device via serial and api.
 logger:
-  level: DEBUG
+  level: DEBUG  #dEBUG to debug, INFO to remove all debug messages
   
 ## This should point to the public location of this yaml file.
 #dashboard_import:
@@ -355,9 +359,6 @@ time:
                 id(diesel_burner_time_on_full) = 0;
                 ESP_LOGD("custom", "Exited time, diesel_burner_time_on_full %.1f, diesel_burner_slow_pwm_val %.1f", (float)id(diesel_burner_time_on_full), (float)id(diesel_burner_slow_pwm_val));
               }
-    # - logger.log:
-    #     format: "Exited time, diesel_burner_time_on_full %.1f, diesel_burner_slow_pwm_val %.1f"
-    #     args: [ 'id(diesel_burner_time_on_full)','id(diesel_burner_slow_pwm_val)' ]      
 output:
 # output to use ESPHome status_led with ESP32-S3 onboard addressable LED
   - platform: template
@@ -703,16 +704,17 @@ switch:
       payload.push_back(0x02);  // low byte address of the coil
       if (id(floor_pump_state) == 1) 
       {
-        if (id(floor_temp_value) > id(floor_temp_limit))  //Turn off if over floor temp limit
-        {
-          payload.push_back(0x00); // OFF
-          id(floor_pump).publish_state(false);
-        }
-        else if (id(floor_temp_value) < id(floor_temp_limit)-4) //Turn on if under floor temp limit - 4 degrees C
-        {
+        //Replace floor temp limit with one that runs all the time, this one only works when turning on the floor pump
+        // if (id(floor_temp_value) > id(floor_temp_limit))  //Turn off if over floor temp limit
+        // {
+        //   payload.push_back(0x00); // OFF
+        //   id(floor_pump).publish_state(false);
+        // }
+        // else if (id(floor_temp_value) < id(floor_temp_limit)-4) //Turn on if under floor temp limit - 4 degrees C
+        // {
           payload.push_back(0xff); // ON
           id(floor_pump).publish_state(true);
-        }
+        // }
       }
       else 
       {
@@ -904,6 +906,7 @@ climate:
       - switch.turn_on: air_cond
       - delay: 20s
       - fan.turn_on: blower_fan
+      - lambda: id(current_fan) = 1;
       - lambda: id(fan_lower_temp) = ${supplemental_cooling_diff} - ${fan_hysteresis};
       - lambda: id(fan_raise_temp) = ${supplemental_cooling_diff} + ${fan_hysteresis};
       - lambda: id(supplemental_diff) = ${supplemental_cooling_diff};
@@ -965,6 +968,7 @@ climate:
       - lambda: id(blower_pwm).set_max_power(0.98);
       - delay: 20s
       - fan.turn_on: blower_fan
+      - lambda: id(current_fan) = 1;
       - lambda: id(climate_action) = 6;
       - logger.log:
           format: "Called fan_only_action"
@@ -1020,6 +1024,7 @@ climate:
       - switch.turn_off: heat_coil_bypass
       - delay: 60s # delay before turning fan on so heat coil gets warm
       - fan.turn_on: blower_fan
+      - lambda: id(current_fan) = 1;
       - lambda: id(fan_lower_temp) = ${supplemental_heating_diff} - ${fan_hysteresis};
       - lambda: id(fan_raise_temp) = ${supplemental_heating_diff} + ${fan_hysteresis};
       - lambda: id(supplemental_diff) = ${supplemental_heating_diff};
@@ -1098,7 +1103,6 @@ script:
                 id(diesel_burner_slow_pwm_val) = 1.;
                 id(diesel_burner_slow_pwm).set_level(1.0);
                 ESP_LOGD("custom", "Setting PWM to 100%");
-
               }  
             }
             else
@@ -1115,13 +1119,37 @@ script:
           }
           ESP_LOGD("custom", "Exited update_diesel_burner_slow_pwm, diesel_burner_time_on_full %.1f, diesel_burner_slow_pwm_val %.1f", (float)id(diesel_burner_time_on_full), (float)id(diesel_burner_slow_pwm_val));
 
-          
-      # - logger.log:
-      #     format: "Exited update_diesel_burner_slow_pwm, diesel_burner_slow_pwm_val %.1f"
-      #     args: [ 'id(diesel_burner_slow_pwm_val)' ]      
-      # - logger.log:
-      #     format: "    diesel_burner_time_on_full %.1f"
-      #     args: [ 'id(diesel_burner_time_on_full)' ]      
+
+  - id: floor_heat_temparature_limit_control
+    then: 
+      - logger.log:
+          format: "Called floor_heat_temparature_limit_control"
+      - lambda: |-
+          if (id(this_thermostat).action == CLIMATE_ACTION_HEATING) //Only when heating
+          { 
+            //If floor temparature is above floor_temp_limit degrees F turn off floor pump, turn on if less than floor_temp_limit -3 deg C (~5 deg F)
+            if (id(floor_temp_value) > id(floor_temp_limit))
+            {
+              //if floor pump is on turn it off
+              if (id(floor_pump_state) > 0.51)
+              {
+                id(floor_pump_state) = 0;
+                id(floor_pump).turn_off();
+                ESP_LOGD("custom", "Turning floor pump off");
+              }  
+            }
+            else if (id(floor_temp_value) < id(floor_temp_limit) - 3)
+            {
+              if (id(floor_pump_state) < 0.51)
+              {
+                id(floor_pump_state) = 1;
+                id(floor_pump).turn_on();
+                ESP_LOGD("custom", "Turning floor pump on");
+              }
+            }
+          }
+          ESP_LOGD("custom", "Exited update_diesel_burner_slow_pwm, diesel_burner_time_on_full %.1f, diesel_burner_slow_pwm_val %.1f", (float)id(diesel_burner_time_on_full), (float)id(diesel_burner_slow_pwm_val));
+
 
   # Update Fan Speed, temp diffs in deg C, 0.5556 deg C = 1 deg F!!! Were 0.5, 1.0, 2.5, med blower speed was 50
   # Changed to work both for cooling and heating 2nd stage (supplemental)
@@ -1148,6 +1176,7 @@ script:
             {
               if ( id(climate_action) == 0)
               {
+                ESP_LOGD("custom", "climate_action == 0");
                 id(fan_lower_temp) = id(supplemental_diff) - ${fan_hysteresis};
                 id(fan_raise_temp) = id(supplemental_diff) + ${fan_hysteresis};
                 auto call = id(blower_fan).turn_off();
@@ -1160,7 +1189,10 @@ script:
                 if (id(diff) > id(fan_raise_temp))
                 {
                   if (id(climate_action) == 2 && id(diff) > ${supplemental_cooling_diff}); //if A/C on and difference is larger turn on fast compressor speed
+                  {
                     id(supplemental_enabled).turn_on(); 
+                    ESP_LOGD("custom", "A/C On, supplemental cooling enable on");
+                  }
                   if (id(current_fan) < 81)
                   {
                     id(fan_raise_temp) += ${fan_hysteresis} * 2;
@@ -1171,9 +1203,14 @@ script:
                       id(fan_lower_temp)  = 9.3;
                     }
                     id(current_fan) += 20; //Increase fan speed
+                    ESP_LOGD("custom", "current_fan < 81, increase");
                   }
                   else
+                  {
                     id(current_fan) = 100; //Increase fan speed
+                    ESP_LOGD("custom", "current_fan increase 100");
+
+                  }
                   auto call = id(blower_fan).make_call();
                   call.set_speed(id(current_fan));
                   call.perform();
@@ -1181,7 +1218,10 @@ script:
                 else if (id(diff) < id(fan_lower_temp))
                 {
                   if (id(climate_action) == 2 && id(diff) < ${supplemental_cooling_diff}-0.25); //if A/C on and difference is smaller turn off fast compressor speed
+                  {
                     id(supplemental_enabled).turn_off(); 
+                    ESP_LOGD("custom", "A/C On, supplemental cooling enable off");
+                  }
                   if (id(current_fan) > 19)
                   {
                     id(fan_lower_temp) -= ${fan_hysteresis} * 2;
@@ -1192,14 +1232,18 @@ script:
                       id(fan_raise_temp) = id(supplemental_diff) + ${fan_hysteresis};
                     }
                     id(current_fan) -= 20; //Decrease fan speed
+                    ESP_LOGD("custom", "current_fan > 19, decrease");
                   }
                   else
+                  {
                     id(current_fan) = 0;
+                    ESP_LOGD("custom", "current_fan decrease 0");
+                  }
 
                   //If the fan speed is in between, leave it the same
                   
                   //Actually set the fan speed  
-                  if (id(current_fan) = 0)
+                  if (id(current_fan) == 0)
                   {
                     auto call = id(blower_fan).turn_off();
                     call.set_speed(0);
@@ -1243,18 +1287,35 @@ script:
             call.set_speed(0);
             call.perform();
             id(current_fan) = 0;
+            ESP_LOGD("custom", "Should not get here, Turning fan off");
           }
           
-      - logger.log:
-          format: "Update fan speed script - calling fan_speed_diagnostic script"
-      - lambda: |-
-          if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO && (id(blower_fan).state)) 
+          ESP_LOGD("fan_script", "Update fan speed script - calling fan_speed_diagnostic script");
+          if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO && id(blower_fan).state) 
           {
-             id(fan_speed_diagnostic).publish_state(id(blower_fan).speed);
+            id(fan_speed_diagnostic).publish_state(id(blower_fan).speed);
           }
-      - logger.log:
-          format: "Exited update_fan_speed, current_fan %.1f, fan_raise_temp %.1f, fan_lower_temp %.1f, climate_action %1d, \ncurrent_temperature %1f, target_temperature_high %1f, target_temperature_low %1f, diff %1f"
-          args: [ 'id(current_fan)','id(fan_raise_temp)','id(fan_lower_temp)', 'id(climate_action)', 'id(this_thermostat).current_temperature', 'id(this_thermostat).target_temperature_high', 'id(this_thermostat).target_temperature_low', 'id(diff)' ]      
+          ESP_LOGD("custom", "Exited update_fan_speed, current_fan %.1f, fan_raise_temp %.1f, fan_lower_temp %.1f, climate_action %1d, \ncurrent_temperature %1f, target_temperature_high %1f, target_temperature_low %1f, diff %1f",
+            (double)id(current_fan),
+            (double)id(fan_raise_temp),
+            (double)id(fan_lower_temp),
+            (int)id(climate_action),
+            (double)id(this_thermostat).current_temperature,
+            (double)id(this_thermostat).target_temperature_high,
+            (double)id(this_thermostat).target_temperature_low,
+            (double)id(diff)
+          );
+
+      # - logger.log:
+      #     format: "Update fan speed script - calling fan_speed_diagnostic script"
+      # - lambda: |-
+      #     if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO && (id(blower_fan).state)) 
+      #     {
+      #        id(fan_speed_diagnostic).publish_state(id(blower_fan).speed);
+      #     }
+      # - logger.log:
+      #     format: "Exited update_fan_speed, current_fan %.1f, fan_raise_temp %.1f, fan_lower_temp %.1f, climate_action %1d, \ncurrent_temperature %1f, target_temperature_high %1f, target_temperature_low %1f, diff %1f"
+      #     args: [ 'id(current_fan)','id(fan_raise_temp)','id(fan_lower_temp)', 'id(climate_action)', 'id(this_thermostat).current_temperature', 'id(this_thermostat).target_temperature_high', 'id(this_thermostat).target_temperature_low', 'id(diff)' ]      
 
   # Update the Status Light
   - id: status_light_update
