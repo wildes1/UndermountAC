@@ -17,7 +17,9 @@
 ##  111625 - Added second_stage_heat_enable and set to 90 min to keep fan-forced heat from coming on unless temp exceeds supplemental_heating_diff
 ##  010825 - Desired, for now just switched climate to use max temp - Added maximum of onboard, driver side and pass side temperature sensors for controlling climate for winter as radiant cooling was affecting temp sensors
 ##           also logic to select which to use based on heat mode (auto uses min)
-##  012125 - Implement desired sensor selection above, Mode COOL uses minimum cabin temperature so we don't overcool, all other modes use maximum (meaning mode AUTO will not overheat but will overcool)
+##  012126 - Implement desired sensor selection above, Mode COOL uses minimum cabin temperature so we don't overcool, all other modes use maximum (meaning mode AUTO will not overheat but will overcool)
+##  030226 - First pass at duty cycle using slow_pwm
+##
 ##
 ##  ToDo - Tekmar T-stat 50% duty cycle is 20 min on, 20 min off, when temp is -1.5 to +1.5 degree of setpoint as follows:
 ##         100% on time at Heat To setting -1.5°F
@@ -47,9 +49,14 @@ substitutions:
   # Constants for climate and fan staging setup, works for both yaml and lambda (sort of like #define in C)
   fan_hysteresis: "0.4"
   supplemental_cooling_diff: "2.0"
-  supplemental_heating_diff: "1.4"
+  supplemental_heating_diff: "1.11" #2 deg F
   second_stage_cool_enable: "50 min"
   second_stage_heat_enable: "500 min" # make long so hopefully it doesn't time out
+  hvac_cool_overrun: "0.25"
+  hvac_cool_deadband: "0.25"
+  hvac_heat_overrun: "0.56" #1 deg F
+  hvac_heat_deadband: "0.0" #0 deg F so it starts 50% duty cycle at setpoint
+
 
   #One Wire temp sensor address and GPIO
   one_wire_address:  "0x13011312B96FAA28"
@@ -66,7 +73,12 @@ esphome:
   # Automatically add the mac address to the name
   # so you can use a single firmware for all devices
   name_add_mac_suffix: false
-
+  on_boot:
+    priority: -100
+    then:
+      output.set_level:
+        id: diesel_burner_slow_pwm
+        level: 0%
 #  # This will allow for (future) project identification,
 #  # configuration and updates. Also needed for dashboard_import below
 #  project:
@@ -242,6 +254,16 @@ globals:
     restore_value: no
     initial_value: "0"
 
+  - id: diesel_burner_slow_pwm_val #0%, 50% and 100% controlled by script
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
+  - id: diesel_burner_time_on_full #number of minutes diesel burner has been at 100%
+    type: int
+    restore_value: no
+    initial_value: "0"
+
 ##########################################################
 #Modbus stuff to read and write DFRobot FIT0827 (CSIO-404)
 ##########################################################
@@ -311,7 +333,31 @@ light:
           max_brightness: 60%
 
 
-
+time:
+  - platform: sntp
+    on_time:
+      # Increment every 1 minutes
+      - seconds: 0
+        minutes: /1
+        then:
+          - lambda: |-
+              if (id(this_thermostat).action == CLIMATE_ACTION_HEATING) //Only when heating
+              { 
+                //If actual temperature lower than 1/2 supplemental heating diff
+                if (id(diesel_burner_slow_pwm_val) > 0.9)
+                {
+                  id(diesel_burner_time_on_full) += 1;
+                  ESP_LOGD("custom", "Exited time, diesel_burner_time_on_full %.1f, diesel_burner_slow_pwm_val %.1f", (float)id(diesel_burner_time_on_full), (float)id(diesel_burner_slow_pwm_val));
+                }
+              }
+              else
+              {
+                id(diesel_burner_time_on_full) = 0;
+                ESP_LOGD("custom", "Exited time, diesel_burner_time_on_full %.1f, diesel_burner_slow_pwm_val %.1f", (float)id(diesel_burner_time_on_full), (float)id(diesel_burner_slow_pwm_val));
+              }
+    # - logger.log:
+    #     format: "Exited time, diesel_burner_time_on_full %.1f, diesel_burner_slow_pwm_val %.1f"
+    #     args: [ 'id(diesel_burner_time_on_full)','id(diesel_burner_slow_pwm_val)' ]      
 output:
 # output to use ESPHome status_led with ESP32-S3 onboard addressable LED
   - platform: template
@@ -332,11 +378,33 @@ output:
   - platform: ledc
     pin: 7
     id: blower_pwm
+    #frequency: "20kHz" #20KHz does not lower noise appreciably and affects fan startup
     power_supply: fan_voltage
     # clamp fan values between 40% and 98% per UndermountAC
     min_power: 0.40
     max_power: 0.98
     zero_means_zero: true # set fan all the way to 0 when off
+
+  - platform: template
+    id: output1
+    type: binary
+    write_action:
+      - then:
+          - lambda: ESP_LOGD("Template Output","set state to %d",state);
+
+  - platform: slow_pwm
+    id: diesel_burner_slow_pwm
+    period: 40min
+    turn_on_action:
+      - logger.log:
+          format: "Called slow_pwm turn_on"
+      - lambda: id(diesel_burner_state) = 1; //Set state to on for diesel burner
+      - switch.turn_on: diesel_burner
+    turn_off_action:
+      - logger.log:
+          format: "Called slow_pwm turn_off"
+      - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
+      - switch.turn_off: diesel_burner
 
 # output pin for fan voltage - is managed by the Fan PWM output
 power_supply:
@@ -721,6 +789,14 @@ switch:
     restore_mode: RESTORE_DEFAULT_OFF
     optimistic: true
 
+  #enable slow_pwm
+  - platform: template
+    id: slow_pwm_enabled
+    name: Enable slow_pwm
+    restore_mode: RESTORE_DEFAULT_OFF
+    optimistic: true
+
+
 fan:
   - platform: speed
     name: "Blower"
@@ -737,7 +813,11 @@ fan:
           format: "Called fan on_speed_set"
   
 
+##########################################################
+##########################################################
+##########################################################
 climate:
+##########################################################
   - platform: thermostat
     name: "Thermostat"
     id: this_thermostat
@@ -760,15 +840,15 @@ climate:
     min_fanning_run_time: 30s
     
     # Added cool_overrun and cool_deadband, changed both from 0.5C default
-    cool_overrun: 0.25
-    cool_deadband: 0.25
-    heat_overrun: 0.25
-    heat_deadband: 0.25
+    cool_overrun: ${hvac_cool_overrun}
+    cool_deadband: ${hvac_cool_deadband}
+    heat_overrun: ${hvac_heat_overrun}
+    heat_deadband: ${hvac_heat_deadband}
 
     # actions for each thermostat state - manage the call for ac, compressor speed, and fan on/of
     heat_action:
       # set min and max fan speeds for normal operation - to protect equipment
-      - lambda: id(blower_pwm).set_min_power(0.15);
+      - lambda: id(blower_pwm).set_min_power(0.25);
       - lambda: id(blower_pwm).set_max_power(0.65); //Heat coil does not need a great deal of airflow
       - switch.turn_off: air_cond
       - delay: 1s
@@ -777,8 +857,18 @@ climate:
       - delay: 2s
       - lambda: id(floor_pump_state) = 1; //Set state to on for floor pump
       - switch.turn_on: floor_pump
-      - lambda: id(diesel_burner_state) = 1; //Set state to on for diesel burner
-      - switch.turn_on: diesel_burner
+      - if:
+          condition:
+            - switch.is_off: slow_pwm_enabled
+          then:
+            - lambda: id(diesel_burner_state) = 1; //Set state to on for diesel burner
+            - switch.turn_off: diesel_burner
+          else:
+            - lambda: id(diesel_burner_slow_pwm_val) = 0.5;
+            - output.set_level:
+                id: diesel_burner_slow_pwm
+                level: 50%
+            - logger.log: "Called heat action output_set_level 50%, diesel_burner_slow_pwm_val should be 0.5"    
       - delay: 20s
       - lambda: id(fan_lower_temp) = ${supplemental_heating_diff} - ${fan_hysteresis};
       - lambda: id(fan_raise_temp) = ${supplemental_heating_diff} + ${fan_hysteresis};
@@ -793,8 +883,17 @@ climate:
       - lambda: id(blower_pwm).set_max_power(0.98);
       - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
       - switch.turn_off: floor_pump
-      - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
-      - switch.turn_off: diesel_burner
+      - if:
+          condition:
+            - switch.is_off: slow_pwm_enabled
+          then:
+            - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
+            - switch.turn_off: diesel_burner
+          else:
+            - lambda: id(diesel_burner_slow_pwm_val) = 0;
+            - output.set_level:
+                id: diesel_burner_slow_pwm
+                level: 0%
       - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
       - switch.turn_on: heat_coil_bypass
       - switch.turn_off: compressor_speed_high
@@ -812,8 +911,17 @@ climate:
       - logger.log:
           format: "Called cool_action"
     idle_action:
-      - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
-      - switch.turn_off: diesel_burner
+      - if:
+          condition:
+            - switch.is_off: slow_pwm_enabled
+          then:
+            - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
+            - switch.turn_off: diesel_burner
+          else:
+            - lambda: id(diesel_burner_slow_pwm_val) = 0;
+            - output.set_level:
+                id: diesel_burner_slow_pwm
+                level: 0%
       - switch.turn_off: air_cond
       - switch.turn_off: compressor_speed_high
       #- lambda: id(blower_pwm).set_max_power(0.40); # ramp down fan
@@ -833,8 +941,17 @@ climate:
     fan_only_action:
       - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
       - switch.turn_off: floor_pump
-      - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
-      - switch.turn_off: diesel_burner
+      - if:
+          condition:
+            - switch.is_off: slow_pwm_enabled
+          then:
+            - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
+            - switch.turn_off: diesel_burner
+          else:
+            - lambda: id(diesel_burner_slow_pwm_val) = 0;
+            - output.set_level:
+                id: diesel_burner_slow_pwm
+                level: 0%
       - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
       - switch.turn_on: heat_coil_bypass
       - switch.turn_off: air_cond
@@ -844,7 +961,7 @@ climate:
           action: script.uac_on
       - delay: 2s
       # set min and max fan speeds to wider range
-      - lambda: id(blower_pwm).set_min_power(0.15);
+      - lambda: id(blower_pwm).set_min_power(0.25);
       - lambda: id(blower_pwm).set_max_power(0.98);
       - delay: 20s
       - fan.turn_on: blower_fan
@@ -854,8 +971,17 @@ climate:
     off_mode:
       - logger.log:
           format: "Called climate Off Mode"
-      - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
-      - switch.turn_off: diesel_burner
+      - if:
+          condition:
+            - switch.is_off: slow_pwm_enabled
+          then:
+            - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
+            - switch.turn_off: diesel_burner
+          else:
+            - lambda: id(diesel_burner_slow_pwm_val) = 0;
+            - output.set_level:
+                id: diesel_burner_slow_pwm
+                level: 0%
       - switch.turn_off: air_cond
       - switch.turn_off: compressor_speed_high
       - delay: 60s # delay before turning fan off to push out any final cold air
@@ -865,15 +991,13 @@ climate:
       - switch.turn_off: floor_pump
       - fan.turn_off: blower_fan
       # set min and max fan speeds to full range - in case fan is used by itself
-      - lambda: id(blower_pwm).set_min_power(0.15);
+      - lambda: id(blower_pwm).set_min_power(0.25);
       - lambda: id(blower_pwm).set_max_power(0.98);
       - delay: 10.0s #delay 10 seconds for fan coast-down
       - homeassistant.action:
           action: script.uac_off
       - delay: 1s
       - lambda: id(climate_action) = 0;
-      - logger.log:
-          format: "Called off_mode"
     
     # turn the compressor to HIGH under these conditions, was 10 min and $supplemental_cooling_diff:
     set_point_minimum_differential: 0.25
@@ -947,12 +1071,58 @@ climate:
     # when any state change occurs on the Thermostat
     on_state:
       - logger.log:
-          format: "Called on_state line 924"
+          format: "on_state called at end of: - platform: thermostat"
       - script.execute: update_fan_speed
+      - if:
+          condition:
+            - switch.is_on: slow_pwm_enabled
+          then:
+            - script.execute: update_diesel_burner_slow_pwm
       - script.execute: status_light_update
 
 
 script:
+  - id: update_diesel_burner_slow_pwm
+    then: 
+      - logger.log:
+          format: "Called update_diesel_burner_slow_pwm"
+      - lambda: |-
+          if (id(this_thermostat).action == CLIMATE_ACTION_HEATING) //Only when heating
+          { 
+            //If actual temperature lower than 1/2 supplemental heating diff
+            if (id(this_thermostat).current_temperature < (id(this_thermostat).target_temperature_low - (${supplemental_heating_diff} / 2)))
+            {
+              //if pwm hasn't been turned to 100% yet
+              if (id(diesel_burner_slow_pwm_val) < 0.51)
+              {
+                id(diesel_burner_slow_pwm_val) = 1.;
+                id(diesel_burner_slow_pwm).set_level(1.0);
+                ESP_LOGD("custom", "Setting PWM to 100%");
+
+              }  
+            }
+            else
+            {
+              //if 100% pwm has been on long enough and we have not turned it down yet
+              if (id(diesel_burner_time_on_full) > 10 && id(diesel_burner_slow_pwm_val) > 0.51)
+              {
+                id(diesel_burner_slow_pwm_val) = 0.5;
+                id(diesel_burner_time_on_full) = 0;
+                id(diesel_burner_slow_pwm).set_level(0.5);
+                ESP_LOGD("custom", "Setting PWM to 50%");
+              }
+            }
+          }
+          ESP_LOGD("custom", "Exited update_diesel_burner_slow_pwm, diesel_burner_time_on_full %.1f, diesel_burner_slow_pwm_val %.1f", (float)id(diesel_burner_time_on_full), (float)id(diesel_burner_slow_pwm_val));
+
+          
+      # - logger.log:
+      #     format: "Exited update_diesel_burner_slow_pwm, diesel_burner_slow_pwm_val %.1f"
+      #     args: [ 'id(diesel_burner_slow_pwm_val)' ]      
+      # - logger.log:
+      #     format: "    diesel_burner_time_on_full %.1f"
+      #     args: [ 'id(diesel_burner_time_on_full)' ]      
+
   # Update Fan Speed, temp diffs in deg C, 0.5556 deg C = 1 deg F!!! Were 0.5, 1.0, 2.5, med blower speed was 50
   # Changed to work both for cooling and heating 2nd stage (supplemental)
   - id: update_fan_speed
@@ -1023,12 +1193,24 @@ script:
                     }
                     id(current_fan) -= 20; //Decrease fan speed
                   }
+                  else
+                    id(current_fan) = 0;
+
                   //If the fan speed is in between, leave it the same
                   
                   //Actually set the fan speed  
-                  auto call = id(blower_fan).make_call();
-                  call.set_speed(id(current_fan));
-                  call.perform();
+                  if (id(current_fan) = 0)
+                  {
+                    auto call = id(blower_fan).turn_off();
+                    call.set_speed(0);
+                    call.perform();
+                  }
+                  else
+                  {
+                    auto call = id(blower_fan).make_call();
+                    call.set_speed(id(current_fan));
+                    call.perform();
+                  }
                 }
                 //otherwise leave fan speed the same
               }
@@ -1071,8 +1253,8 @@ script:
              id(fan_speed_diagnostic).publish_state(id(blower_fan).speed);
           }
       - logger.log:
-          format: "Exited update_fan_speed, fan_raise_temp %.1f, fan_lower_temp %.1f, climate_action %1d, \ncurrent_temperature %1f, target_temperature_high %1f, target_temperature_low %1f, diff %1f"
-          args: [ 'id(fan_raise_temp)','id(fan_lower_temp)', 'id(climate_action)', 'id(this_thermostat).current_temperature', 'id(this_thermostat).target_temperature_high', 'id(this_thermostat).target_temperature_low', 'id(diff)' ]      
+          format: "Exited update_fan_speed, current_fan %.1f, fan_raise_temp %.1f, fan_lower_temp %.1f, climate_action %1d, \ncurrent_temperature %1f, target_temperature_high %1f, target_temperature_low %1f, diff %1f"
+          args: [ 'id(current_fan)','id(fan_raise_temp)','id(fan_lower_temp)', 'id(climate_action)', 'id(this_thermostat).current_temperature', 'id(this_thermostat).target_temperature_high', 'id(this_thermostat).target_temperature_low', 'id(diff)' ]      
 
   # Update the Status Light
   - id: status_light_update
