@@ -21,6 +21,8 @@
 ##  030226 - First pass at duty cycle using slow_pwm
 ##  030326 - Continue to develop, rewrote floor temp limit to be active all the time and debugged fan speed issues
 ##  032426 - Implemented water heater controls
+##  032426 - Added Hot water recirc relay, noted where state variables were used in modbus controls for stability
+##  032526 - Mostly fixed multiple turn_on and turn_off's that caused "partial responses" for diesel burner, floor pump and heat coil bypass
 ##
 ##
 ##    HVAC Enable slow_pwm switch: on enables slow PWM behavior similar to described below, off disables slow PWM, burner is on constantly when heat is called
@@ -242,11 +244,6 @@ globals:
     restore_value: no
     initial_value: "0"
 
-  - id: floor_pump_state #on when 1 - stage 1 heat, use with diesel burner, will have cutout based on floor temp
-    type: int
-    restore_value: no
-    initial_value: "0"
-
   - id: diesel_burner_state #on when 1 - calling for stage 1, 2 - calling for stage 2, 3 - calling for hot water
     type: int
     restore_value: no
@@ -256,6 +253,16 @@ globals:
     type: int
     restore_value: no
     initial_value: "1"
+
+  - id: floor_pump_state #on when 1 - stage 1 heat, use with diesel burner, will have cutout based on floor temp
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  # - id: hot_water_recirc_state #on when 1 - recirculate hot water back to fresh tank
+  #   type: int
+  #   restore_value: no
+  #   initial_value: "0"
 
   - id: climate_action #0 = off, 2 = cool, 3 = heat, 6 = fan only, 4 = idle
     type: int
@@ -280,6 +287,17 @@ globals:
 ##########################################################
 #Modbus stuff to read and write DFRobot FIT0827 (CSIO-404)
 ##########################################################
+# external_components:
+#     - source: github://pr#8032
+#       components: [ modbus, uart, modbus_controller ]
+
+# uart:
+#   rx_full_threshold: 1
+
+# modbus:
+#   send_wait_time: 600ms
+#   turnaround_time: 100ms
+
 uart:
   - id: uart_modbus_server
     tx_pin: GPIO2 #verified on board
@@ -287,16 +305,21 @@ uart:
     baud_rate: 9600
     #stop_bits: 1
     debug:
+    rx_full_threshold: 1
 
 modbus:
   - uart_id: uart_modbus_server
     id: modbus_server
     role: server
+    # send_wait_time: 200ms
+    send_wait_time: 600ms
+    turnaround_time: 100ms
 
 modbus_controller:
   - id: csio_1
     modbus_id: modbus_server
     address: 0xfe #Broadcast address works on units as shipped from Undermount AC (Default address of 0 does not work per doc)
+    # update_interval: 1s
 
 #binary_sensor: #no binary_sensors
 
@@ -418,13 +441,28 @@ output:
     turn_on_action:
       - logger.log:
           format: "Called slow_pwm turn_on"
-      - lambda: id(diesel_burner_state) = 1; //Set state to on for diesel burner
-      - switch.turn_on: diesel_burner
+      # - lambda: if (id(diesel_burner_state) == 0) { id(diesel_burner_state) = 1; id(diesel_burner).turn_on(); }
+      - if:
+          condition:
+            - switch.is_off: diesel_burner
+          then:              
+            - lambda: id(diesel_burner_state) = 1; //Set state to on for diesel burner
+            - switch.turn_on: diesel_burner
+      # - lambda: id(diesel_burner_state) = 1; //Set state to on for diesel burner
+      # - switch.turn_on: diesel_burner
+
     turn_off_action:
       - logger.log:
           format: "Called slow_pwm turn_off"
-      - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
-      - switch.turn_off: diesel_burner
+      # - lambda: if (id(diesel_burner_state) == 1) { id(diesel_burner_state) = 0; id(diesel_burner).turn_off(); }
+      - if:
+          condition:
+            - switch.is_on: diesel_burner
+          then:              
+            - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
+            - switch.turn_off: diesel_burner
+      # - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
+      # - switch.turn_off: diesel_burner
 
 # output pin for fan voltage - is managed by the Fan PWM output
 power_supply:
@@ -633,7 +671,7 @@ switch:
 #Modbus stuff to read and write DFRobot FIT0827 (CSIO-404)
 ##########################################################
   # Diesel Burner control
-  # uses diesel_burner_state to turn on and off as I don't yet know how to extract state
+  # uses diesel_burner_state to turn on and off as it seems more stable than using "x" for switch state, had several instances of turning on then off for one second
   #   in a lambda, ToDo try later
   - platform: modbus_controller
     id: diesel_burner
@@ -651,24 +689,26 @@ switch:
       payload.push_back(0x5);  // force single coil
       payload.push_back(0x00); // high byte address of the coil
       payload.push_back(0x00);  // low byte address of the coil
+      // if (x)
       if (id(diesel_burner_state) == 1) 
       {
-        payload.push_back(0xff); // ON
+        // id(diesel_burner_state) = 1;
         id(diesel_burner).publish_state(true);
+        payload.push_back(0xff); // ON
+        payload.push_back(0x00);  //Rest of ON or OFF
+        return 1;
       }
       else 
       {
-        payload.push_back(0x00); // OFF
+        // id(diesel_burner_state) = 0;
         id(diesel_burner).publish_state(false);
-      }
-      payload.push_back(0x00);  //Rest of ON or OFF
-      if (id(diesel_burner_state) == 0) 
+        payload.push_back(0x00); // OFF
+        payload.push_back(0x00);  //Rest of ON or OFF
         return 0;
-      else
-        return 1;
+      }
 ##########################################################
   # Heat Coil Bypass Valve
-  # uses heat_coil_bypass_state to turn on and off as I don't yet know how to extract state
+  # uses heat_coil_bypass_state to turn on and off as it seems more stable than using "x" for switch state, had several instances of turning on then off for one second
   #   in a lambda, ToDo try later
   - platform: modbus_controller
     id: heat_coil_bypass
@@ -686,24 +726,26 @@ switch:
       payload.push_back(0x5);  // force single coil
       payload.push_back(0x00); // high byte address of the coil
       payload.push_back(0x01);  // low byte address of the coil
+      // if (x)
       if (id(heat_coil_bypass_state) == 1) 
       {
-        payload.push_back(0xff); // ON
+        // id(heat_coil_bypass_state) = 1; 
         id(heat_coil_bypass).publish_state(true);
+        payload.push_back(0xff); // ON
+        payload.push_back(0x00);  //Rest of ON or OFF
+        return 1;
       }
       else 
       {
+        // id(heat_coil_bypass_state) = 0; 
         payload.push_back(0x00); // OFF
+        payload.push_back(0x00);  //Rest of ON or OFF
         id(heat_coil_bypass).publish_state(false);
-      }
-      payload.push_back(0x00);  //Rest of ON or OFF
-      if (id(heat_coil_bypass_state) == 0) 
         return 0;
-      else
-        return 1;
+      }
 ##########################################################
   # Floor Pump control
-  # uses floor_pump_state to turn on and off as I don't yet know how to extract state
+  # uses floor_pump_state to turn on and off as it seems more stable than using "x" for switch state, had several instances of turning on then off for one second
   #   in a lambda, ToDo try later
   - platform: modbus_controller
     id: floor_pump
@@ -721,30 +763,61 @@ switch:
       payload.push_back(0x5);  // force single coil
       payload.push_back(0x00); // high byte address of the coil
       payload.push_back(0x02);  // low byte address of the coil
+      // if (x)
       if (id(floor_pump_state) == 1) 
       {
-        //Replace floor temp limit with one that runs all the time, this one only works when turning on the floor pump
-        // if (id(floor_temp_value) > id(floor_temp_limit))  //Turn off if over floor temp limit
-        // {
-        //   payload.push_back(0x00); // OFF
-        //   id(floor_pump).publish_state(false);
-        // }
-        // else if (id(floor_temp_value) < id(floor_temp_limit)-4) //Turn on if under floor temp limit - 4 degrees C
-        // {
-          payload.push_back(0xff); // ON
-          id(floor_pump).publish_state(true);
-        // }
+        // id(floor_pump_state) = 1;
+        id(floor_pump).publish_state(true);
+        payload.push_back(0xff); // ON
+        payload.push_back(0x00);  //Rest of ON or OFF
+        return 1;
       }
       else 
       {
-        payload.push_back(0x00); // OFF
+        // id(floor_pump_state) = 0;
         id(floor_pump).publish_state(false);
-      }
-      payload.push_back(0x00);  //Rest of ON or OFF
-      if (id(floor_pump_state) == 0) 
+        payload.push_back(0x00); // OFF
+        payload.push_back(0x00);  //Rest of ON or OFF
         return 0;
-      else
+      }
+
+##########################################################
+  # Hot Water Recirc control
+  # does not use uses hot_water_recirc_state to turn on and off as it must be controlled by HA user as well and we will tolerate on/off/on...
+  #   in a lambda, ToDo try later
+  - platform: modbus_controller
+    id: hot_water_recirc
+    modbus_controller_id: csio_1
+    name: "Hot Water Recirc Control"
+    # Relay 4, address 3
+    #address: 3 #0:relay1 1:relay2 ...
+    #register_type: coil
+    bitmask: 0x1
+    # custom command with no payload gets rid of "function code: 0x1 exception: 2" error
+    custom_command: [ ]
+    # implement using write_lambda
+    write_lambda: |-
+      payload.push_back(0xfe);  // device address
+      payload.push_back(0x5);  // force single coil
+      payload.push_back(0x00); // high byte address of the coil
+      payload.push_back(0x03);  // low byte address of the coil
+      if (x)
+      // if (id(hot_water_recirc_state) == 1) 
+      {
+        // id(hot_water_recirc_state) = 1;
+        id(hot_water_recirc).publish_state(true);
+        payload.push_back(0xff); // ON
+        payload.push_back(0x00);  //Rest of ON or OFF
         return 1;
+      }
+      else 
+      {
+        // id(hot_water_recirc_state) = 0;
+        id(hot_water_recirc).publish_state(false);
+        payload.push_back(0x00); // OFF
+        payload.push_back(0x00);  //Rest of ON or OFF
+        return 0;
+      }
 
 ##########################################################
 ##########################################################
@@ -917,8 +990,14 @@ climate:
       # set min and max fan speeds for normal operation - to protect equipment
       - lambda: id(blower_pwm).set_min_power(0.40); 
       - lambda: id(blower_pwm).set_max_power(0.98);
-      - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
-      - switch.turn_off: floor_pump
+      - if:
+          condition:
+            - switch.is_on: floor_pump
+          then:              
+            - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
+            - switch.turn_off: floor_pump
+      # - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
+      # - switch.turn_off: floor_pump
       - if:
           condition:
             - switch.is_on: water_heater
@@ -938,8 +1017,14 @@ climate:
                   - output.set_level:
                       id: diesel_burner_slow_pwm
                       level: 0%
-      - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
-      - switch.turn_on: heat_coil_bypass
+      - if:
+          condition:
+            - switch.is_off: heat_coil_bypass
+          then:              
+            - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
+            - switch.turn_on: heat_coil_bypass
+      # - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
+      # - switch.turn_on: heat_coil_bypass
       - switch.turn_off: compressor_speed_high
       - delay: 1s
       - homeassistant.action:
@@ -977,12 +1062,22 @@ climate:
                       level: 0%
       - switch.turn_off: air_cond
       - switch.turn_off: compressor_speed_high
-      #- lambda: id(blower_pwm).set_max_power(0.40); # ramp down fan
+      ##- lambda: id(blower_pwm).set_max_power(0.40); # ramp down fan
       - delay: 60s # delay before turning fan off to push out any final cold air
-      - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
-      - switch.turn_on: heat_coil_bypass
-      - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
-      - switch.turn_off: floor_pump
+      - if:
+          condition:
+            - switch.is_off: heat_coil_bypass
+          then:              
+            - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
+            - switch.turn_on: heat_coil_bypass
+      - if:
+          condition:
+            - switch.is_on: floor_pump
+          then:              
+            - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
+            - switch.turn_off: floor_pump
+      # - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
+      # - switch.turn_off: floor_pump
       - fan.turn_off: blower_fan
       - delay: 10.0s #delay 10 seconds for fan coast-down
       - homeassistant.action:
@@ -992,8 +1087,14 @@ climate:
       - logger.log:
           format: "Called idle_action"
     fan_only_action:
-      - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
-      - switch.turn_off: floor_pump
+      - if:
+          condition:
+            - switch.is_on: floor_pump
+          then:              
+            - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
+            - switch.turn_off: floor_pump
+      # - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
+      # - switch.turn_off: floor_pump
       - if:
           condition:
             - switch.is_on: water_heater
@@ -1013,8 +1114,12 @@ climate:
                   - output.set_level:
                       id: diesel_burner_slow_pwm
                       level: 0%
-      - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
-      - switch.turn_on: heat_coil_bypass
+      - if:
+          condition:
+            - switch.is_off: heat_coil_bypass
+          then:              
+            - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
+            - switch.turn_on: heat_coil_bypass
       - switch.turn_off: air_cond
       - switch.turn_off: compressor_speed_high
       - delay: 1s
@@ -1055,10 +1160,20 @@ climate:
       - switch.turn_off: air_cond
       - switch.turn_off: compressor_speed_high
       - delay: 60s # delay before turning fan off to push out any final cold air
-      - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
-      - switch.turn_on: heat_coil_bypass
-      - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
-      - switch.turn_off: floor_pump
+      - if:
+          condition:
+            - switch.is_off: heat_coil_bypass
+          then:              
+            - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
+            - switch.turn_on: heat_coil_bypass
+      - if:
+          condition:
+            - switch.is_on: floor_pump
+          then:              
+            - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
+            - switch.turn_off: floor_pump
+      # - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
+      # - switch.turn_off: floor_pump
       - fan.turn_off: blower_fan
       # set min and max fan speeds to full range - in case fan is used by itself
       - lambda: id(blower_pwm).set_min_power(0.25);
@@ -1168,6 +1283,7 @@ script:
               {
                 id(diesel_burner_slow_pwm_val) = 1.0;
                 id(diesel_burner_slow_pwm).set_level(1.0);
+                // if (!id(diesel_burner).state) //Turn on only if off
                 if (id(diesel_burner_state) == 0) //Turn on only if off
                 {
                   id(diesel_burner_state) = 1; // Set state to on for diesel burner
@@ -1175,6 +1291,7 @@ script:
                 }
                 ESP_LOGD("custom", "Setting PWM to 100%");
               } 
+              // if (!id(diesel_burner).state) //Turn on only if off
               else if (id(diesel_burner_state) == 0)  //Turn on only if off
               {
                 id(diesel_burner_state) = 1; // Set state to on for diesel burner
@@ -1188,6 +1305,7 @@ script:
               { 
                 //Do nothing, we want burner on or PWM controlled
               }
+              // else if (id(diesel_burner).state)  //Turn off only if on
               else if (id(diesel_burner_state) == 1)  //Turn off only if on
               {
                 id(diesel_burner_state) = 0; // Set state to off for diesel burner
@@ -1195,12 +1313,13 @@ script:
               }
             }
           } 
-          if (id(this_thermostat).action == CLIMATE_ACTION_HEATING) // Only when heating
+          else if (id(this_thermostat).action == CLIMATE_ACTION_HEATING) // Only when heating
           { 
             //Do nothing, we want burner on or PWM controlled
           }
           else
           {
+            // if (id(diesel_burner).state)  //Turn off only if on
             if (id(diesel_burner_state) == 1)  //Turn off only if on
             {
               id(diesel_burner_state) = 0; // Set state to off for diesel burner
@@ -1226,6 +1345,7 @@ script:
               {
                 id(diesel_burner_slow_pwm_val) = 1.;
                 id(diesel_burner_slow_pwm).set_level(1.0);
+                // if (!id(diesel_burner).state) //Turn on only if off
                 if (id(diesel_burner_state) == 0) //Turn on only if off
                 {
                   id(diesel_burner_state) = 1; // Set state to on for diesel burner
@@ -1260,6 +1380,7 @@ script:
             if (id(floor_temp_value) > id(floor_temp_limit))
             {
               //if floor pump is on turn it off
+              //if (id(floor_pump).state)
               if (id(floor_pump_state) > 0.51)
               {
                 id(floor_pump_state) = 0;
@@ -1269,6 +1390,7 @@ script:
             }
             else if (id(floor_temp_value) < id(floor_temp_limit) - 3)
             {
+              // if (!id(floor_pump).state)  //Only if on
               if (id(floor_pump_state) < 0.51)
               {
                 id(floor_pump_state) = 1;
@@ -1294,13 +1416,7 @@ script:
             else if (id(this_thermostat).action == CLIMATE_ACTION_COOLING && id(this_thermostat).current_temperature > id(this_thermostat).target_temperature_high)
               id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_high);
             else //handles idle or other unexpected states
-            {
-              id(diff) = 0.;  //Try setting diff to 0 here, we should not be actively heating or cooling at this time, or we have overcooled or overheated due to min run time
-              //if (fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_high) < fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_low))
-              //  id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_high);
-              //else
-              //  id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_low);
-            }
+              id(diff) = 0.;  //Set diff to 0 here, we should not be actively heating or cooling at this time, or we have overcooled or overheated due to min run time
             if(id(blower_fan).state)  //If fan is on 
             {
               if ( id(climate_action) == 0)
@@ -1374,9 +1490,12 @@ script:
                   //Actually set the fan speed  
                   if (id(current_fan) == 0)
                   {
-                    auto call = id(blower_fan).turn_off();
-                    call.set_speed(0);
-                    call.perform();
+                    if (id(blower_fan).state)  //If fan is on and it should be off
+                    {
+                      auto call = id(blower_fan).turn_off();
+                      call.set_speed(0);
+                      call.perform();
+                    }
                   }
                   else
                   {
@@ -1412,11 +1531,14 @@ script:
           }
           else  //should not get here!!!
           {
-            auto call = id(blower_fan).turn_off();
-            call.set_speed(0);
-            call.perform();
-            id(current_fan) = 0;
-            ESP_LOGD("custom", "Should not get here, Turning fan off");
+            if (id(blower_fan).state)  //If fan is on and it should be off
+            {
+              auto call = id(blower_fan).turn_off();
+              call.set_speed(0);
+              call.perform();
+              id(current_fan) = 0;
+              ESP_LOGD("custom", "Should not get here, Turning fan off");
+            }
           }
           
           ESP_LOGD("fan_script", "Update fan speed script - calling fan_speed_diagnostic script");
@@ -1434,17 +1556,6 @@ script:
             (double)id(this_thermostat).target_temperature_low,
             (double)id(diff)
           );
-
-      # - logger.log:
-      #     format: "Update fan speed script - calling fan_speed_diagnostic script"
-      # - lambda: |-
-      #     if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO && (id(blower_fan).state)) 
-      #     {
-      #        id(fan_speed_diagnostic).publish_state(id(blower_fan).speed);
-      #     }
-      # - logger.log:
-      #     format: "Exited update_fan_speed, current_fan %.1f, fan_raise_temp %.1f, fan_lower_temp %.1f, climate_action %1d, \ncurrent_temperature %1f, target_temperature_high %1f, target_temperature_low %1f, diff %1f"
-      #     args: [ 'id(current_fan)','id(fan_raise_temp)','id(fan_lower_temp)', 'id(climate_action)', 'id(this_thermostat).current_temperature', 'id(this_thermostat).target_temperature_high', 'id(this_thermostat).target_temperature_low', 'id(diff)' ]      
 
   # Update the Status Light
   - id: status_light_update
