@@ -20,6 +20,7 @@
 ##  012126 - Implement desired sensor selection above, Mode COOL uses minimum cabin temperature so we don't overcool, all other modes use maximum (meaning mode AUTO will not overheat but will overcool)
 ##  030226 - First pass at duty cycle using slow_pwm
 ##  030326 - Continue to develop, rewrote floor temp limit to be active all the time and debugged fan speed issues
+##  032426 - Implemented water heater controls
 ##
 ##
 ##    HVAC Enable slow_pwm switch: on enables slow PWM behavior similar to described below, off disables slow PWM, burner is on constantly when heat is called
@@ -60,6 +61,9 @@ substitutions:
   hvac_cool_deadband: "0.25"
   hvac_heat_overrun: "0.56" #1 deg F
   hvac_heat_deadband: "0.0" #0 deg F so it starts 50% duty cycle at setpoint
+
+  # Water Heater Timeout value in minutes (when turned on, it will turn off after this timeout)
+  water_heat_timeout: "15"
 
 
   #One Wire temp sensor address and GPIO
@@ -268,6 +272,11 @@ globals:
     restore_value: no
     initial_value: "0"
 
+  - id: water_heater_time_on #number of minutes water heater has been on
+    type: int
+    restore_value: no
+    initial_value: "0"
+
 ##########################################################
 #Modbus stuff to read and write DFRobot FIT0827 (CSIO-404)
 ##########################################################
@@ -345,7 +354,17 @@ time:
         minutes: /1
         then:
           - lambda: |-
-              if (id(this_thermostat).action == CLIMATE_ACTION_HEATING) //Only when heating
+              if (id(water_heater).state) //Only when burner on for heating water
+              { 
+                  id(water_heater_time_on) += 1;
+                  ESP_LOGD("custom", "Entered time, water_heater on, water_heater_time_on %.1f", (float)id(water_heater_time_on));
+              }
+              else
+              {
+                id(water_heater_time_on) = 0;
+                ESP_LOGD("custom", "Entered time, water_heater off, water_heater_time_on %.1f", (float)id(water_heater_time_on));
+              }
+              if (id(this_thermostat).action == CLIMATE_ACTION_HEATING && id(slow_pwm_enabled).state) //Only when heating and slow_pwm_enabled == on
               { 
                 //If actual temperature lower than 1/2 supplemental heating diff
                 if (id(diesel_burner_slow_pwm_val) > 0.9)
@@ -798,6 +817,13 @@ switch:
     restore_mode: RESTORE_DEFAULT_OFF
     optimistic: true
 
+  #water heater
+  - platform: template
+    id: water_heater
+    name: Water Heater
+    restore_mode: RESTORE_DEFAULT_OFF
+    optimistic: true
+
 
 fan:
   - platform: speed
@@ -861,16 +887,24 @@ climate:
       - switch.turn_on: floor_pump
       - if:
           condition:
-            - switch.is_off: slow_pwm_enabled
+            - switch.is_on: water_heater
           then:
-            - lambda: id(diesel_burner_state) = 1; //Set state to on for diesel burner
-            - switch.turn_off: diesel_burner
+            # Turn on Boiler regardless of heat call
+            - lambda: id(diesel_burner_state) = 1;
+            - switch.turn_on: diesel_burner
           else:
-            - lambda: id(diesel_burner_slow_pwm_val) = 0.5;
-            - output.set_level:
-                id: diesel_burner_slow_pwm
-                level: 50%
-            - logger.log: "Called heat action output_set_level 50%, diesel_burner_slow_pwm_val should be 0.5"    
+            - if:
+                condition:
+                  - switch.is_off: slow_pwm_enabled
+                then:
+                  - lambda: id(diesel_burner_state) = 1;
+                  - switch.turn_on: diesel_burner
+                else:
+                  - lambda: id(diesel_burner_slow_pwm_val) = 0.5;
+                  - output.set_level:
+                      id: diesel_burner_slow_pwm
+                      level: 50%
+                  - logger.log: "Called heat action output_set_level 50%, diesel_burner_slow_pwm_val should be 0.5"
       - delay: 20s
       - lambda: id(fan_lower_temp) = ${supplemental_heating_diff} - ${fan_hysteresis};
       - lambda: id(fan_raise_temp) = ${supplemental_heating_diff} + ${fan_hysteresis};
@@ -887,15 +921,23 @@ climate:
       - switch.turn_off: floor_pump
       - if:
           condition:
-            - switch.is_off: slow_pwm_enabled
+            - switch.is_on: water_heater
           then:
-            - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
-            - switch.turn_off: diesel_burner
+            # Turn on Boiler regardless of heat call
+            - lambda: id(diesel_burner_state) = 1;
+            - switch.turn_on: diesel_burner
           else:
-            - lambda: id(diesel_burner_slow_pwm_val) = 0;
-            - output.set_level:
-                id: diesel_burner_slow_pwm
-                level: 0%
+            - if:
+                condition:
+                  - switch.is_off: slow_pwm_enabled
+                then:
+                  - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
+                  - switch.turn_off: diesel_burner
+                else:
+                  - lambda: id(diesel_burner_slow_pwm_val) = 0;
+                  - output.set_level:
+                      id: diesel_burner_slow_pwm
+                      level: 0%
       - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
       - switch.turn_on: heat_coil_bypass
       - switch.turn_off: compressor_speed_high
@@ -916,15 +958,23 @@ climate:
     idle_action:
       - if:
           condition:
-            - switch.is_off: slow_pwm_enabled
+            - switch.is_on: water_heater
           then:
-            - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
-            - switch.turn_off: diesel_burner
+            # Turn on Boiler regardless of heat call
+            - lambda: id(diesel_burner_state) = 1;
+            - switch.turn_on: diesel_burner
           else:
-            - lambda: id(diesel_burner_slow_pwm_val) = 0;
-            - output.set_level:
-                id: diesel_burner_slow_pwm
-                level: 0%
+            - if:
+                condition:
+                  - switch.is_off: slow_pwm_enabled
+                then:
+                  - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
+                  - switch.turn_off: diesel_burner
+                else:
+                  - lambda: id(diesel_burner_slow_pwm_val) = 0;
+                  - output.set_level:
+                      id: diesel_burner_slow_pwm
+                      level: 0%
       - switch.turn_off: air_cond
       - switch.turn_off: compressor_speed_high
       #- lambda: id(blower_pwm).set_max_power(0.40); # ramp down fan
@@ -946,15 +996,23 @@ climate:
       - switch.turn_off: floor_pump
       - if:
           condition:
-            - switch.is_off: slow_pwm_enabled
+            - switch.is_on: water_heater
           then:
-            - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
-            - switch.turn_off: diesel_burner
+            # Turn on Boiler regardless of heat call
+            - lambda: id(diesel_burner_state) = 1;
+            - switch.turn_on: diesel_burner
           else:
-            - lambda: id(diesel_burner_slow_pwm_val) = 0;
-            - output.set_level:
-                id: diesel_burner_slow_pwm
-                level: 0%
+            - if:
+                condition:
+                  - switch.is_off: slow_pwm_enabled
+                then:
+                  - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
+                  - switch.turn_off: diesel_burner
+                else:
+                  - lambda: id(diesel_burner_slow_pwm_val) = 0;
+                  - output.set_level:
+                      id: diesel_burner_slow_pwm
+                      level: 0%
       - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
       - switch.turn_on: heat_coil_bypass
       - switch.turn_off: air_cond
@@ -977,15 +1035,23 @@ climate:
           format: "Called climate Off Mode"
       - if:
           condition:
-            - switch.is_off: slow_pwm_enabled
+            - switch.is_on: water_heater
           then:
-            - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
-            - switch.turn_off: diesel_burner
+            # Turn on Boiler regardless of heat call
+            - lambda: id(diesel_burner_state) = 1;
+            - switch.turn_on: diesel_burner
           else:
-            - lambda: id(diesel_burner_slow_pwm_val) = 0;
-            - output.set_level:
-                id: diesel_burner_slow_pwm
-                level: 0%
+            - if:
+                condition:
+                  - switch.is_off: slow_pwm_enabled
+                then:
+                  - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
+                  - switch.turn_off: diesel_burner
+                else:
+                  - lambda: id(diesel_burner_slow_pwm_val) = 0;
+                  - output.set_level:
+                      id: diesel_burner_slow_pwm
+                      level: 0%
       - switch.turn_off: air_cond
       - switch.turn_off: compressor_speed_high
       - delay: 60s # delay before turning fan off to push out any final cold air
@@ -1078,6 +1144,7 @@ climate:
       - logger.log:
           format: "on_state called at end of: - platform: thermostat"
       - script.execute: update_fan_speed
+      - script.execute: update_water_heater_status
       - if:
           condition:
             - switch.is_on: slow_pwm_enabled
@@ -1087,6 +1154,63 @@ climate:
 
 
 script:
+  - id: update_water_heater_status
+    then:
+      - logger.log:
+          format: "Called update_water_heater_status"
+      - lambda: |-
+          if (id(water_heater).state) // Only when water heater on
+          { 
+            // If water heater on time has not timed out
+            if (id(water_heater_time_on) < ${water_heat_timeout}) 
+            {
+              if (id(slow_pwm_enabled) && id(diesel_burner_slow_pwm_val) < 0.51) 
+              {
+                id(diesel_burner_slow_pwm_val) = 1.0;
+                id(diesel_burner_slow_pwm).set_level(1.0);
+                if (id(diesel_burner_state) == 0) //Turn on only if off
+                {
+                  id(diesel_burner_state) = 1; // Set state to on for diesel burner
+                  id(diesel_burner).turn_on();
+                }
+                ESP_LOGD("custom", "Setting PWM to 100%");
+              } 
+              else if (id(diesel_burner_state) == 0)  //Turn on only if off
+              {
+                id(diesel_burner_state) = 1; // Set state to on for diesel burner
+                id(diesel_burner).turn_on();
+              }
+            } 
+            else 
+            {
+              id(water_heater).turn_off(); // Turn water heater switch off
+              if (id(this_thermostat).action == CLIMATE_ACTION_HEATING) // Only when heating
+              { 
+                //Do nothing, we want burner on or PWM controlled
+              }
+              else if (id(diesel_burner_state) == 1)  //Turn off only if on
+              {
+                id(diesel_burner_state) = 0; // Set state to off for diesel burner
+                id(diesel_burner).turn_off();
+              }
+            }
+          } 
+          if (id(this_thermostat).action == CLIMATE_ACTION_HEATING) // Only when heating
+          { 
+            //Do nothing, we want burner on or PWM controlled
+          }
+          else
+          {
+            if (id(diesel_burner_state) == 1)  //Turn off only if on
+            {
+              id(diesel_burner_state) = 0; // Set state to off for diesel burner
+              id(diesel_burner).turn_off();
+            }
+          }
+          ESP_LOGD("custom", "Exited update_water_heater_status, water_heater: %s, time_on: %.1f", 
+                    id(water_heater).state ? "ON" : "OFF", 
+                    (float)id(water_heater_time_on));
+
   - id: update_diesel_burner_slow_pwm
     then: 
       - logger.log:
@@ -1102,13 +1226,18 @@ script:
               {
                 id(diesel_burner_slow_pwm_val) = 1.;
                 id(diesel_burner_slow_pwm).set_level(1.0);
+                if (id(diesel_burner_state) == 0) //Turn on only if off
+                {
+                  id(diesel_burner_state) = 1; // Set state to on for diesel burner
+                  id(diesel_burner).turn_on();
+                }
                 ESP_LOGD("custom", "Setting PWM to 100%");
               }  
             }
             else
             {
               //if 100% pwm has been on long enough and we have not turned it down yet
-              if (id(diesel_burner_time_on_full) > 10 && id(diesel_burner_slow_pwm_val) > 0.51)
+              if ((id(diesel_burner_time_on_full) > 10) && (id(diesel_burner_slow_pwm_val) > 0.51) && (!(id(water_heater).state)))
               {
                 id(diesel_burner_slow_pwm_val) = 0.5;
                 id(diesel_burner_time_on_full) = 0;
