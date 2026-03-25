@@ -33,10 +33,18 @@ Evaporater in and out temperatures are now measured.  Future use will be to allo
 
 A boiler supply temperature sensor was also added.
 
-All of the new temperature sensors are one-wire sensors.
+All of the new temperature sensors are one-wire sensors for a total of 6, connectors for 7 were hot-glued to the case of the ESPHome Thermostat
 
 Selection of cabin temperature sensors based on thermostat mode added to keep from overheating or over-cooling due to radiant heat effects from sensors on the sunny side
 
 3/3/2026 - added first pass at duty cycle using slow_pwm to imitate Tekmar Thermostat "PWM" function.  No perfect as it does not start the 50% duty cycle until under the setpoint, have not tried negative deadband... 
+
+3/25/2026 - added water heat capability (Water Heater switch), will run the diesel burner for a fixed period of time, also added a recirc valve control "Hot Water Recirc Control" that can be used with a HA automation along with boiler temperature recirculate the water to fixtures when it is hot enough.  This works with the heat exchanger that the above-mentioned commercially available hydronis radient heat system has used for a couple of years, it does not use a tank.  The recirc valve should be connected using relay 4 of the CSIO-404 modbus relay board.
+
+CSIO-404 Relay usage:
+Relay 1:  "Diesel Burner Control"
+Relay 2:  "Heat Coil Bypass (Off = Goes through Heat Coil)"
+Relay 3:  "Floor Pump Control"
+Relay 4:  "Hot Water Recirc Control"
 
 Questions, comments, improvements?  Please post in discussions using the link above.
