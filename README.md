@@ -41,6 +41,8 @@ Selection of cabin temperature sensors based on thermostat mode added to keep fr
 
 3/25/2026 - added water heat capability (Water Heater switch), will run the diesel burner for a fixed period of time, also added a recirc valve control "Hot Water Recirc Control" that can be used with a HA automation along with boiler temperature recirculate the water to fixtures when it is hot enough.  This works with the heat exchanger that the above-mentioned commercially available hydronis radient heat system has used for a couple of years, it does not use a tank.  The recirc valve should be connected using relay 4 of the CSIO-404 modbus relay board.
 
+3/26/2026 - Added water_heater.yaml to wait for water to get hot (as measured by boiler temperature) then run the recirculator for a short period of time.
+
 CSIO-404 Relay usage:
 Relay 1:  "Diesel Burner Control"
 Relay 2:  "Heat Coil Bypass (Off = Goes through Heat Coil)"
