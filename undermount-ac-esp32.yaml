@@ -23,6 +23,7 @@
 ##  032426 - Implemented water heater controls
 ##  032426 - Added Hot water recirc relay, noted where state variables were used in modbus controls for stability
 ##  032526 - Mostly fixed multiple turn_on and turn_off's that caused "partial responses" for diesel burner, floor pump and heat coil bypass
+##  032626 - Changed water heater timeout to 30 minutes, automation in HA is used for shorter timeouts
 ##
 ##
 ##    HVAC Enable slow_pwm switch: on enables slow PWM behavior similar to described below, off disables slow PWM, burner is on constantly when heat is called
@@ -65,7 +66,7 @@ substitutions:
   hvac_heat_deadband: "0.0" #0 deg F so it starts 50% duty cycle at setpoint
 
   # Water Heater Timeout value in minutes (when turned on, it will turn off after this timeout)
-  water_heat_timeout: "15"
+  water_heat_timeout: "30"
 
 
   #One Wire temp sensor address and GPIO
