@@ -1,0 +1,54 @@
+alias: Water heater timer
+description: ""
+triggers:
+  - trigger: state
+    entity_id:
+      - switch.hvac_water_heater
+    to: "on"
+    from: "off"
+conditions: []
+actions:
+  - action: switch.turn_on
+    metadata: {}
+    target:
+      entity_id: switch.hvac_water_heater
+    data: {}
+  - variables:
+      start_time: "{{ now() }}"
+  - repeat:
+      until:
+        - or:
+            - condition: numeric_state
+              entity_id: sensor.ac_control_boiler_supply_temperature
+              above: 125
+            - condition: state
+              entity_id: switch.ac_control_diesel_burner_control
+              state: "off"
+            - condition: template
+              value_template: "{{ now() > (start_time + timedelta(minutes=15)) }}"
+      sequence:
+        - delay:
+            hours: 0
+            minutes: 1
+            seconds: 0
+            milliseconds: 0
+  - action: switch.turn_on
+    metadata: {}
+    target:
+      entity_id: switch.hvac_hot_water_recirc_control
+    data: {}
+  - delay:
+      seconds: 10
+  - action: switch.turn_off
+    metadata: {}
+    target:
+      entity_id: switch.hvac_hot_water_recirc_control
+    data: {}
+  - delay:
+      minutes: 1
+  - action: switch.turn_off
+    metadata: {}
+    target:
+      entity_id: switch.hvac_water_heater
+    data: {}
+mode: single
