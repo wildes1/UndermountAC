@@ -25,7 +25,8 @@
 ##  032526 - Mostly fixed multiple turn_on and turn_off's that caused "partial responses" for diesel burner, floor pump and heat coil bypass
 ##  032626 - Changed water heater timeout to 30 minutes, automation in HA is used for shorter timeouts
 ##  050826 - Cleanup, actually call floor temp limit script added on 030326 at state changes, move UAC compressor power relay from an external relay to output 5
-##  051126 - Refactor to eliminate blower turning off while compressor is on (ai assisted)
+##  051126 - Add fixes to eliminate blower turning off while compressor is on (ai assisted)
+##  051126 - Refactor update_fan_speed to reduce fan speed "hunting", AI assisted, WIP
 ##
 ##
 ##    HVAC Enable slow_pwm switch: on enables slow PWM behavior similar to described below, off disables slow PWM, burner is on constantly when heat is called
