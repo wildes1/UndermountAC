@@ -1,54 +1,40 @@
 alias: Water heater timer
-description: ""
+description: Starts boiler, waits for 125°F or a 15m timeout, then runs recirc pump
 triggers:
   - trigger: state
-    entity_id:
-      - switch.hvac_water_heater
-    to: "on"
+    entity_id: switch.hvac_water_heater
     from: "off"
+    to: "on"
 conditions: []
 actions:
   - action: switch.turn_on
-    metadata: {}
     target:
-      entity_id: switch.hvac_water_heater
-    data: {}
-  - variables:
-      start_time: "{{ now() }}"
-  - repeat:
-      until:
-        - or:
-            - condition: numeric_state
-              entity_id: sensor.ac_control_boiler_supply_temperature
-              above: 125
-            - condition: state
-              entity_id: switch.ac_control_diesel_burner_control
-              state: "off"
-            - condition: template
-              value_template: "{{ now() > (start_time + timedelta(minutes=15)) }}"
-      sequence:
-        - delay:
-            hours: 0
-            minutes: 1
-            seconds: 0
-            milliseconds: 0
+      entity_id:
+        - switch.hvac_water_heater
+        - switch.rear_driver_side_relay_board_fresh_water_pump
+  - wait_for_trigger:
+      - trigger: numeric_state
+        entity_id: sensor.ac_control_boiler_supply_temperature
+        above: 125
+    timeout:
+      minutes: 15
+    continue_on_timeout: true
+  - delay: "00:01:00"
   - action: switch.turn_on
-    metadata: {}
     target:
       entity_id: switch.hvac_hot_water_recirc_control
-    data: {}
   - delay:
-      seconds: 10
+      hours: 0
+      minutes: 0
+      seconds: 20
+      milliseconds: 0
   - action: switch.turn_off
-    metadata: {}
     target:
       entity_id: switch.hvac_hot_water_recirc_control
-    data: {}
-  - delay:
-      minutes: 1
+  - delay: "00:15:00"
   - action: switch.turn_off
-    metadata: {}
     target:
-      entity_id: switch.hvac_water_heater
-    data: {}
-mode: single
+      entity_id:
+        - switch.hvac_water_heater
+        - switch.rear_driver_side_relay_board_fresh_water_pump
+mode: restart
