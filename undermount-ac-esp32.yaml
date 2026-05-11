@@ -24,6 +24,8 @@
 ##  032426 - Added Hot water recirc relay, noted where state variables were used in modbus controls for stability
 ##  032526 - Mostly fixed multiple turn_on and turn_off's that caused "partial responses" for diesel burner, floor pump and heat coil bypass
 ##  032626 - Changed water heater timeout to 30 minutes, automation in HA is used for shorter timeouts
+##  050826 - Cleanup, actually call floor temp limit script added on 030326 at state changes, move UAC compressor power relay from an external relay to output 5
+##  051126 - Refactor to eliminate blower turning off while compressor is on (ai assisted)
 ##
 ##
 ##    HVAC Enable slow_pwm switch: on enables slow PWM behavior similar to described below, off disables slow PWM, burner is on constantly when heat is called
@@ -673,7 +675,6 @@ switch:
 ##########################################################
   # Diesel Burner control
   # uses diesel_burner_state to turn on and off as it seems more stable than using "x" for switch state, had several instances of turning on then off for one second
-  #   in a lambda, ToDo try later
   - platform: modbus_controller
     id: diesel_burner
     modbus_controller_id: csio_1
@@ -710,7 +711,6 @@ switch:
 ##########################################################
   # Heat Coil Bypass Valve
   # uses heat_coil_bypass_state to turn on and off as it seems more stable than using "x" for switch state, had several instances of turning on then off for one second
-  #   in a lambda, ToDo try later
   - platform: modbus_controller
     id: heat_coil_bypass
     modbus_controller_id: csio_1
@@ -747,7 +747,6 @@ switch:
 ##########################################################
   # Floor Pump control
   # uses floor_pump_state to turn on and off as it seems more stable than using "x" for switch state, had several instances of turning on then off for one second
-  #   in a lambda, ToDo try later
   - platform: modbus_controller
     id: floor_pump
     modbus_controller_id: csio_1
@@ -785,7 +784,6 @@ switch:
 ##########################################################
   # Hot Water Recirc control
   # does not use uses hot_water_recirc_state to turn on and off as it must be controlled by HA user as well and we will tolerate on/off/on...
-  #   in a lambda, ToDo try later
   - platform: modbus_controller
     id: hot_water_recirc
     modbus_controller_id: csio_1
@@ -865,9 +863,11 @@ switch:
   # output 5
   - platform: gpio
     pin: 20
-    id: output_5
-    name: Output 5
-    disabled_by_default: true
+    name: Undermount AC Power (do not move)
+    id: uac_power
+    internal: false
+    restore_mode: ALWAYS_OFF
+    #disabled_by_default: true
 
   # output 6
   - platform: gpio
@@ -909,11 +909,18 @@ fan:
       - lambda: id(fan_speed_diagnostic).publish_state(id(blower_fan).speed);
       - logger.log:
           format: "Called fan on_turn_off"
+      # ===== FIX (Safety Interlock): If blower turns off while compressor is on, shut compressor down =====
+      - if:
+          condition:
+            switch.is_on: air_cond
+          then:
+            - logger.log: "SAFETY: Blower OFF while compressor ON -> shutting compressor down"
+            - switch.turn_off: compressor_speed_high
+            - switch.turn_off: air_cond
     on_speed_set:
       - lambda: id(fan_speed_diagnostic).publish_state(id(blower_fan).speed);
       - logger.log:
           format: "Called fan on_speed_set"
-  
 
 ##########################################################
 ##########################################################
@@ -954,8 +961,7 @@ climate:
       - lambda: id(blower_pwm).set_max_power(0.65); //Heat coil does not need a great deal of airflow
       - switch.turn_off: air_cond
       - delay: 1s
-      - homeassistant.action:
-          action: script.uac_on
+      - switch.turn_on: uac_power      
       - delay: 2s
       - lambda: id(floor_pump_state) = 1; //Set state to on for floor pump
       - switch.turn_on: floor_pump
@@ -1028,8 +1034,7 @@ climate:
       # - switch.turn_on: heat_coil_bypass
       - switch.turn_off: compressor_speed_high
       - delay: 1s
-      - homeassistant.action:
-          action: script.uac_on
+      - switch.turn_on: uac_power      
       - delay: 2s
       - switch.turn_on: air_cond
       - delay: 20s
@@ -1081,8 +1086,7 @@ climate:
       # - switch.turn_off: floor_pump
       - fan.turn_off: blower_fan
       - delay: 10.0s #delay 10 seconds for fan coast-down
-      - homeassistant.action:
-          action: script.uac_off
+      - switch.turn_off: uac_power
       - delay: 1s
       - lambda: id(climate_action) = 4;
       - logger.log:
@@ -1124,8 +1128,7 @@ climate:
       - switch.turn_off: air_cond
       - switch.turn_off: compressor_speed_high
       - delay: 1s
-      - homeassistant.action:
-          action: script.uac_on
+      - switch.turn_on: uac_power      
       - delay: 2s
       # set min and max fan speeds to wider range
       - lambda: id(blower_pwm).set_min_power(0.25);
@@ -1180,8 +1183,7 @@ climate:
       - lambda: id(blower_pwm).set_min_power(0.25);
       - lambda: id(blower_pwm).set_max_power(0.98);
       - delay: 10.0s #delay 10 seconds for fan coast-down
-      - homeassistant.action:
-          action: script.uac_off
+      - switch.turn_off: uac_power
       - delay: 1s
       - lambda: id(climate_action) = 0;
     
@@ -1267,6 +1269,7 @@ climate:
           then:
             - script.execute: update_diesel_burner_slow_pwm
       - script.execute: status_light_update
+      - script.execute: floor_heat_temperature_limit_control
 
 
 script:
@@ -1370,10 +1373,10 @@ script:
           ESP_LOGD("custom", "Exited update_diesel_burner_slow_pwm, diesel_burner_time_on_full %.1f, diesel_burner_slow_pwm_val %.1f", (float)id(diesel_burner_time_on_full), (float)id(diesel_burner_slow_pwm_val));
 
 
-  - id: floor_heat_temparature_limit_control
+  - id: floor_heat_temperature_limit_control
     then: 
       - logger.log:
-          format: "Called floor_heat_temparature_limit_control"
+          format: "Called floor_heat_temperature_limit_control"
       - lambda: |-
           if (id(this_thermostat).action == CLIMATE_ACTION_HEATING) //Only when heating
           { 
@@ -1400,7 +1403,7 @@ script:
               }
             }
           }
-          ESP_LOGD("custom", "Exited update_diesel_burner_slow_pwm, diesel_burner_time_on_full %.1f, diesel_burner_slow_pwm_val %.1f", (float)id(diesel_burner_time_on_full), (float)id(diesel_burner_slow_pwm_val));
+          ESP_LOGD("custom", "Exited floor_heat_temperature_limit_control, floor_pump_state %.1f, floor_temp_value %.1f", (float)id(floor_pump_state), (float)id(floor_temp_value));
 
 
   # Update Fan Speed, temp diffs in deg C, 0.5556 deg C = 1 deg F!!! Were 0.5, 1.0, 2.5, med blower speed was 50
@@ -1410,15 +1413,30 @@ script:
       - logger.log:
           format: "Called update_fan_speed script"
       - lambda: |-
+          const int MIN_BLOWER_WHEN_COMPRESSOR = 20;
           if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO)
           { 
             if (id(this_thermostat).action == CLIMATE_ACTION_HEATING && id(this_thermostat).current_temperature < id(this_thermostat).target_temperature_low)
               id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_low);
             else if (id(this_thermostat).action == CLIMATE_ACTION_COOLING && id(this_thermostat).current_temperature > id(this_thermostat).target_temperature_high)
               id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_high);
-            else //handles idle or other unexpected states
-              id(diff) = 0.;  //Set diff to 0 here, we should not be actively heating or cooling at this time, or we have overcooled or overheated due to min run time
-            if(id(blower_fan).state)  //If fan is on 
+            else
+              id(diff) = 0.;
+
+            // ===== FIX (Safety Interlock): Compressor ON -> blower must be ON and non-zero =====
+            if (id(air_cond).state)
+            {
+              if (id(current_fan) < MIN_BLOWER_WHEN_COMPRESSOR)
+                id(current_fan) = MIN_BLOWER_WHEN_COMPRESSOR;
+
+              if (!id(blower_fan).state)
+              {
+                id(blower_fan).make_call().set_speed(id(current_fan)).perform();
+                id(blower_fan).turn_on().perform();
+              }
+            }
+
+            if(id(blower_fan).state)
             {
               if ( id(climate_action) == 0)
               {
@@ -1434,7 +1452,8 @@ script:
               {
                 if (id(diff) > id(fan_raise_temp))
                 {
-                  if (id(climate_action) == 2 && id(diff) > ${supplemental_cooling_diff}); //if A/C on and difference is larger turn on fast compressor speed
+                  // ===== FIX: removed stray semicolon + tied to real thermostat action =====
+                  if (id(this_thermostat).action == CLIMATE_ACTION_COOLING && id(diff) > ${supplemental_cooling_diff})
                   {
                     id(supplemental_enabled).turn_on(); 
                     ESP_LOGD("custom", "A/C On, supplemental cooling enable on");
@@ -1463,7 +1482,8 @@ script:
                 }
                 else if (id(diff) < id(fan_lower_temp))
                 {
-                  if (id(climate_action) == 2 && id(diff) < ${supplemental_cooling_diff}-0.25); //if A/C on and difference is smaller turn off fast compressor speed
+                  // ===== FIX: removed stray semicolon + tied to real thermostat action =====
+                  if (id(this_thermostat).action == CLIMATE_ACTION_COOLING && id(diff) < (${supplemental_cooling_diff}-0.25))
                   {
                     id(supplemental_enabled).turn_off(); 
                     ESP_LOGD("custom", "A/C On, supplemental cooling enable off");
@@ -1491,11 +1511,21 @@ script:
                   //Actually set the fan speed  
                   if (id(current_fan) == 0)
                   {
-                    if (id(blower_fan).state)  //If fan is on and it should be off
+                    // ===== FIX (Safety Interlock): prevent blower OFF while compressor ON =====
+                    if (id(air_cond).state)
                     {
-                      auto call = id(blower_fan).turn_off();
-                      call.set_speed(0);
-                      call.perform();
+                      id(current_fan) = MIN_BLOWER_WHEN_COMPRESSOR;
+                      id(blower_fan).make_call().set_speed(id(current_fan)).perform();
+                      id(blower_fan).turn_on().perform();
+                    }
+                    else
+                    {
+                      if (id(blower_fan).state)
+                      {
+                        auto call = id(blower_fan).turn_off();
+                        call.set_speed(0);
+                        call.perform();
+                      }
                     }
                   }
                   else
@@ -1632,7 +1662,21 @@ script:
                 green: 100%
                 blue: 100%
                 brightness: 20%
-                effect: "Pulse"            
+                effect: "Pulse"
+
+# ===== FIX (Watchdog): periodic check ensures compressor can't stay on with blower off =====
+interval:
+  - interval: 5s
+    then:
+      - if:
+          condition:
+            and:
+              - switch.is_on: air_cond
+              - fan.is_off: blower_fan
+          then:
+            - logger.log: "WATCHDOG: compressor on while blower off -> shutting down compressor"
+            - switch.turn_off: compressor_speed_high
+            - switch.turn_off: air_cond
 
 ## Run temp sensors every minute (minimize heating, prevent failures with some sensors)...
 ##   This is debugged but should only be used if there are sensor lock up issues
