@@ -380,6 +380,7 @@ light:
 
 time:
   - platform: sntp
+    id: time_component
     on_time:
       # Increment every 1 minutes
       - seconds: 0
@@ -1419,7 +1420,7 @@ script:
           format: "Called update_fan_speed script"
       - lambda: |-
           const int MIN_BLOWER = 20;
-          auto now = id(time).now().timestamp();
+          auto now = id(time_component).now().timestamp();
           bool can_change = (now - id(last_fan_change_time)) >= (${fan_change_cooldown_minutes} * 60.0);
 
           if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO)
