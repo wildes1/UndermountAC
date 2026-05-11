@@ -15,7 +15,7 @@ The Heat addition module is used for all heating system relays due to system con
 
 The Heat addition module connects to the ESPHome thermostat controller RS-485 port with the cable provided with the heat capable NextGen thermostat.  Disassemble the thermostat and remove the cable from the connector and the back of the thermostat (there is a grommet that the cable goes through that can be removed to get the connector through).
 
-The floor temp sensor used is a One Wire (Dallas DS18B20).  It was installed in the floor alongside the NTC thermistor that the radiant heat system kit provided.  The One Wire device was selected as it was on-hand and known good.  An SHT3xx device can also be used, however it will need a separate I2C bus unless one with a different I2C address (chip select) can be procured.  
+The floor temp sensor used is a One Wire (Dallas DS18B20).  It was installed in the floor alongside the NTC thermistor that the radiant heat system kit provided.  The One Wire device was selected as it was on-hand and known good.  An SHT3xx device can also be used in addition to the SHT30 used to measure cabin temperature and humidity, however it will need a separate I2C bus unless one with a different I2C address (chip select) can be procured.  
 
 For retrofitting an existing floor the ESPHome integration [https://esphome.io/components/sensor/ntc.html](https://esphome.io/components/sensor/ntc.html) can be used with appropriate hardware (a search for "ntc esphome" gives some results) to add to the UndermountAC ESPHome box.  
 
