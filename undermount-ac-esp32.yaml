@@ -1420,7 +1420,7 @@ script:
           format: "Called update_fan_speed script"
       - lambda: |-
           const int MIN_BLOWER = 20;
-          auto now = id(time_component).now().timestamp();
+          auto now = id(time_component).now().timestamp;
           bool can_change = (now - id(last_fan_change_time)) >= (${fan_change_cooldown_minutes} * 60.0);
 
           if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO)
@@ -1440,8 +1440,9 @@ script:
                 id(current_fan) = MIN_BLOWER;
               if (!id(blower_fan).state)
               {
-                id(blower_fan).turn_on();
-                id(blower_fan).set_speed(id(current_fan));
+                auto call = id(blower_fan).turn_on();
+                call.set_speed(id(current_fan));
+                call.perform();
               }
             }
 
@@ -1508,8 +1509,9 @@ script:
                 }
                 else
                 {
-                  id(blower_fan).turn_on();
-                  id(blower_fan).set_speed(target_speed);
+                  auto call = id(blower_fan).turn_on();
+                  call.set_speed(target_speed);
+                  call.perform();
                 }
                 id(last_fan_change_time) = now;
                 ESP_LOGD("custom", "Fan speed changed to %d", target_speed);
@@ -1521,8 +1523,9 @@ script:
             if (id(current_fan) != 15 && can_change)
             {
               id(current_fan) = 15;
-              id(blower_fan).turn_on();
-              id(blower_fan).set_speed(15);
+              auto call = id(blower_fan).turn_on();
+              call.set_speed(15);
+              call.perform();
               id(last_fan_change_time) = now;
             }
           }
@@ -1531,8 +1534,9 @@ script:
             if (id(current_fan) != 40 && can_change)
             {
               id(current_fan) = 40;
-              id(blower_fan).turn_on();
-              id(blower_fan).set_speed(40);
+              auto call = id(blower_fan).turn_on();
+              call.set_speed(40);
+              call.perform();
               id(last_fan_change_time) = now;
             }
           }
@@ -1541,8 +1545,9 @@ script:
             if (id(current_fan) != 100 && can_change)
             {
               id(current_fan) = 100;
-              id(blower_fan).turn_on();
-              id(blower_fan).set_speed(100);
+              auto call = id(blower_fan).turn_on();
+              call.set_speed(100);
+              call.perform();
               id(last_fan_change_time) = now;
             }
           }
