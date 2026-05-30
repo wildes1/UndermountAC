@@ -27,6 +27,7 @@
 ##  050826 - Cleanup, actually call floor temp limit script added on 030326 at state changes, move UAC compressor power relay from an external relay to output 5
 ##  051126 - Add fixes to eliminate blower turning off while compressor is on (ai assisted)
 ##  051126 - Refactor update_fan_speed to reduce fan speed "hunting", AI assisted, WIP
+##  051826 - Added purge_blower variable as the blower was being started and stopped prematurely by the fan speed script
 ##
 ##
 ##    HVAC Enable slow_pwm switch: on enables slow PWM behavior similar to described below, off disables slow PWM, burner is on constantly when heat is called
@@ -73,6 +74,8 @@ substitutions:
 
   # Fan speed change cooldown in minutes to prevent audible annoyance
   fan_change_cooldown_minutes: "3"
+
+  #One Wire temp sensor address and GPIO
   one_wire_address:  "0x13011312B96FAA28"
   one_wire2_address: "0x2df941c335646128"
   one_wire3_address: "0xef5a85c335646128"
@@ -289,6 +292,8 @@ globals:
     initial_value: "0"
 
   - id: water_heater_time_on #number of minutes water heater has been on
+    type: int
+  - id: purge_blower  #set while running blower to purge or not running blower during A/C pre-cool
     type: int
     restore_value: no
     initial_value: "0"
@@ -937,7 +942,7 @@ climate:
   - platform: thermostat
     name: "Thermostat"
     id: this_thermostat
-    sensor: maximum_cabin_temp # minimum_cabin_temp #for summer
+    sensor: minimum_cabin_temp # maximum_cabin_temp # for winter # minimum_cabin_temp #for summer
     visual:
       temperature_step:
         target_temperature: 1
@@ -1039,13 +1044,20 @@ climate:
             - switch.turn_on: heat_coil_bypass
       # - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
       # - switch.turn_on: heat_coil_bypass
+      - lambda: id(purge_blower) = 1;
       - switch.turn_off: compressor_speed_high
       - delay: 1s
       - switch.turn_on: uac_power      
       - delay: 2s
       - switch.turn_on: air_cond
+      
+      # --- DIAGNOSTIC LOGS ---
+      - logger.log: "AC turned on. Starting 20 second fan delay..."
       - delay: 20s
+      - logger.log: "20 seconds finished. Turning on blower..."
+      
       - fan.turn_on: blower_fan
+      - lambda: id(purge_blower) = 0;
       - lambda: id(current_fan) = 1;
       - lambda: id(fan_lower_temp) = ${supplemental_cooling_diff} - ${fan_hysteresis};
       - lambda: id(fan_raise_temp) = ${supplemental_cooling_diff} + ${fan_hysteresis};
@@ -1073,10 +1085,6 @@ climate:
                   - output.set_level:
                       id: diesel_burner_slow_pwm
                       level: 0%
-      - switch.turn_off: air_cond
-      - switch.turn_off: compressor_speed_high
-      ##- lambda: id(blower_pwm).set_max_power(0.40); # ramp down fan
-      - delay: 60s # delay before turning fan off to push out any final cold air
       - if:
           condition:
             - switch.is_off: heat_coil_bypass
@@ -1091,14 +1099,25 @@ climate:
             - switch.turn_off: floor_pump
       # - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
       # - switch.turn_off: floor_pump
+      - lambda: id(purge_blower) = 1;
+      - switch.turn_off: air_cond
+      - switch.turn_off: compressor_speed_high
+      - logger.log:
+          format: "Called air_cond off - idle_action"
+      ##- lambda: id(blower_pwm).set_max_power(0.40); # ramp down fan
+      - delay: 60s # delay before turning fan off to push out any final cold air
       - fan.turn_off: blower_fan
-      - delay: 10.0s #delay 10 seconds for fan coast-down
+      - lambda: id(purge_blower) = 0;
+      - logger.log:
+          format: "Called blower_fan off - idle_action"
+      - delay: 15.0s #delay 15 seconds for fan coast-down
       - switch.turn_off: uac_power
       - delay: 1s
       - lambda: id(climate_action) = 4;
       - logger.log:
           format: "Called idle_action"
     fan_only_action:
+      - lambda: id(purge_blower) = 0;
       - if:
           condition:
             - switch.is_on: floor_pump
@@ -1168,9 +1187,6 @@ climate:
                   - output.set_level:
                       id: diesel_burner_slow_pwm
                       level: 0%
-      - switch.turn_off: air_cond
-      - switch.turn_off: compressor_speed_high
-      - delay: 60s # delay before turning fan off to push out any final cold air
       - if:
           condition:
             - switch.is_off: heat_coil_bypass
@@ -1185,11 +1201,20 @@ climate:
             - switch.turn_off: floor_pump
       # - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
       # - switch.turn_off: floor_pump
+      - lambda: id(purge_blower) = 1;
+      - switch.turn_off: air_cond
+      - switch.turn_off: compressor_speed_high
+      - logger.log:
+          format: "Called air_cond off - off_mode"
+      - delay: 60s
       - fan.turn_off: blower_fan
+      - lambda: id(purge_blower) = 0;
+      - logger.log:
+          format: "Called blower_fan off - off_mode"
       # set min and max fan speeds to full range - in case fan is used by itself
       - lambda: id(blower_pwm).set_min_power(0.25);
       - lambda: id(blower_pwm).set_max_power(0.98);
-      - delay: 10.0s #delay 10 seconds for fan coast-down
+      - delay: 15.0s #delay 15 seconds for fan coast-down
       - switch.turn_off: uac_power
       - delay: 1s
       - lambda: id(climate_action) = 0;
@@ -1423,153 +1448,156 @@ script:
           auto now = id(time_component).now().timestamp;
           bool can_change = (now - id(last_fan_change_time)) >= (${fan_change_cooldown_minutes} * 60.0);
 
-          if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO)
+          if (id(purge_blower) == 0)
           {
-            // Compute temperature difference
-            if (id(this_thermostat).action == CLIMATE_ACTION_HEATING && id(this_thermostat).current_temperature < id(this_thermostat).target_temperature_low)
-              id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_low);
-            else if (id(this_thermostat).action == CLIMATE_ACTION_COOLING && id(this_thermostat).current_temperature > id(this_thermostat).target_temperature_high)
-              id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_high);
-            else
-              id(diff) = 0.0;
-
-            // Safety: Ensure blower is on and at minimum when compressor is active
-            if (id(air_cond).state)
-            {
-              if (id(current_fan) < MIN_BLOWER)
-                id(current_fan) = MIN_BLOWER;
-              if (!id(blower_fan).state)
-              {
-                auto call = id(blower_fan).turn_on();
-                call.set_speed(id(current_fan));
-                call.perform();
-              }
-            }
-
-            if (id(climate_action) == 0)
-            {
-              // Turn off fan when no action
-              if (can_change)
-              {
-                id(blower_fan).turn_off();
-                id(current_fan) = 0;
-                id(last_fan_change_time) = now;
-              }
-            }
-            else
-            {
-              // Compute target speed proportionally within hysteresis band
-              float base_diff = id(supplemental_diff);
-              float lower_bound = base_diff - ${fan_hysteresis};
-              float upper_bound = base_diff + ${fan_hysteresis};
-              int target_speed = 0;
-
-              if (id(diff) <= lower_bound)
-              {
-                target_speed = 0;
-              }
-              else if (id(diff) >= upper_bound)
-              {
-                target_speed = 100;
-              }
-              else
-              {
-                // Linear interpolation between lower and upper bounds
-                float range = upper_bound - lower_bound;
-                target_speed = round(((id(diff) - lower_bound) / range) * 100.0);
-                target_speed = std::max(0, std::min(100, target_speed));
-              }
-
-              // Ensure minimum speed if compressor is on
-              if (id(air_cond).state && target_speed < MIN_BLOWER)
-                target_speed = MIN_BLOWER;
-
-              // Handle supplemental cooling
-              if (id(this_thermostat).action == CLIMATE_ACTION_COOLING)
-              {
-                if (id(diff) > ${supplemental_cooling_diff})
-                {
-                  id(supplemental_enabled).turn_on();
-                  ESP_LOGD("custom", "Supplemental cooling enabled");
-                }
-                else if (id(diff) < ${supplemental_cooling_diff} - 0.25)
-                {
-                  id(supplemental_enabled).turn_off();
-                  ESP_LOGD("custom", "Supplemental cooling disabled");
-                }
-              }
-
-              // Apply speed change if different and cooldown allows
-              if (target_speed != id(current_fan) && can_change)
-              {
-                id(current_fan) = target_speed;
-                if (target_speed == 0)
-                {
-                  id(blower_fan).turn_off();
-                }
-                else
-                {
-                  auto call = id(blower_fan).turn_on();
-                  call.set_speed(target_speed);
-                  call.perform();
-                }
-                id(last_fan_change_time) = now;
-                ESP_LOGD("custom", "Fan speed changed to %d", target_speed);
-              }
-            }
-          }
-          else if (id(this_thermostat).fan_mode == CLIMATE_FAN_LOW)
-          {
-            if (id(current_fan) != 15 && can_change)
-            {
-              id(current_fan) = 15;
-              auto call = id(blower_fan).turn_on();
-              call.set_speed(15);
-              call.perform();
-              id(last_fan_change_time) = now;
-            }
-          }
-          else if (id(this_thermostat).fan_mode == CLIMATE_FAN_MEDIUM)
-          {
-            if (id(current_fan) != 40 && can_change)
-            {
-              id(current_fan) = 40;
-              auto call = id(blower_fan).turn_on();
-              call.set_speed(40);
-              call.perform();
-              id(last_fan_change_time) = now;
-            }
-          }
-          else if (id(this_thermostat).fan_mode == CLIMATE_FAN_HIGH)
-          {
-            if (id(current_fan) != 100 && can_change)
-            {
-              id(current_fan) = 100;
-              auto call = id(blower_fan).turn_on();
-              call.set_speed(100);
-              call.perform();
-              id(last_fan_change_time) = now;
-            }
-          }
-          else
-          {
-            // Unknown mode, turn off
-            if (id(blower_fan).state && can_change)
-            {
-              id(blower_fan).turn_off();
-              id(current_fan) = 0;
-              id(last_fan_change_time) = now;
-              ESP_LOGD("custom", "Unknown fan mode, turning off");
-            }
-          }
-
-          // Diagnostic
-          if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO && id(blower_fan).state)
-          {
-            id(fan_speed_diagnostic).publish_state(id(blower_fan).speed);
-          }
-          ESP_LOGD("custom", "Exited update_fan_speed, current_fan %d, diff %.1f, can_change %d",
-            id(current_fan), (double)id(diff), can_change);
+	          if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO)
+	          {
+	            // Compute temperature difference
+	            if (id(this_thermostat).action == CLIMATE_ACTION_HEATING && id(this_thermostat).current_temperature < id(this_thermostat).target_temperature_low)
+	              id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_low);
+	            else if (id(this_thermostat).action == CLIMATE_ACTION_COOLING && id(this_thermostat).current_temperature > id(this_thermostat).target_temperature_high)
+	              id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_high);
+	            else
+	              id(diff) = 0.0;
+	
+	            // Safety: Ensure blower is on and at minimum when compressor is active
+	            if (id(air_cond).state)
+	            {
+	              if (id(current_fan) < MIN_BLOWER)
+	                id(current_fan) = MIN_BLOWER;
+	              if (!id(blower_fan).state)
+	              {
+	                auto call = id(blower_fan).turn_on();
+	                call.set_speed(id(current_fan));
+	                call.perform();
+	              }
+	            }
+	
+	            if (id(climate_action) == 0)
+	            {
+	              // Turn off fan when no action
+	              if (can_change)
+	              {
+	                id(blower_fan).turn_off();
+	                id(current_fan) = 0;
+	                id(last_fan_change_time) = now;
+	              }
+	            }
+	            else
+	            {
+	              // Compute target speed proportionally within hysteresis band
+	              float base_diff = id(supplemental_diff);
+	              float lower_bound = base_diff - ${fan_hysteresis};
+	              float upper_bound = base_diff + ${fan_hysteresis};
+	              int target_speed = 0;
+	
+	              if (id(diff) <= lower_bound)
+	              {
+	                target_speed = 0;
+	              }
+	              else if (id(diff) >= upper_bound)
+	              {
+	                target_speed = 100;
+	              }
+	              else
+	              {
+	                // Linear interpolation between lower and upper bounds
+	                float range = upper_bound - lower_bound;
+	                target_speed = round(((id(diff) - lower_bound) / range) * 100.0);
+	                target_speed = std::max(0, std::min(100, target_speed));
+	              }
+	
+	              // Ensure minimum speed if compressor is on
+	              if (id(air_cond).state && target_speed < MIN_BLOWER)
+	                target_speed = MIN_BLOWER;
+	
+	              // Handle supplemental cooling
+	              if (id(this_thermostat).action == CLIMATE_ACTION_COOLING)
+	              {
+	                if (id(diff) > ${supplemental_cooling_diff})
+	                {
+	                  id(supplemental_enabled).turn_on();
+	                  ESP_LOGD("custom", "Supplemental cooling enabled");
+	                }
+	                else if (id(diff) < ${supplemental_cooling_diff} - 0.25)
+	                {
+	                  id(supplemental_enabled).turn_off();
+	                  ESP_LOGD("custom", "Supplemental cooling disabled");
+	                }
+	              }
+	
+	              // Apply speed change if different and cooldown allows
+	              if (target_speed != id(current_fan) && can_change)
+	              {
+	                id(current_fan) = target_speed;
+	                if (target_speed == 0)
+	                {
+	                  id(blower_fan).turn_off();
+	                }
+	                else
+	                {
+	                  auto call = id(blower_fan).turn_on();
+	                  call.set_speed(target_speed);
+	                  call.perform();
+	                }
+	                id(last_fan_change_time) = now;
+	                ESP_LOGD("custom", "Fan speed changed to %d", target_speed);
+	              }
+	            }
+	          }
+	          else if (id(this_thermostat).fan_mode == CLIMATE_FAN_LOW)
+	          {
+	            if (id(current_fan) != 15 && can_change)
+	            {
+	              id(current_fan) = 15;
+	              auto call = id(blower_fan).turn_on();
+	              call.set_speed(15);
+	              call.perform();
+	              id(last_fan_change_time) = now;
+	            }
+	          }
+	          else if (id(this_thermostat).fan_mode == CLIMATE_FAN_MEDIUM)
+	          {
+	            if (id(current_fan) != 40 && can_change)
+	            {
+	              id(current_fan) = 40;
+	              auto call = id(blower_fan).turn_on();
+	              call.set_speed(40);
+	              call.perform();
+	              id(last_fan_change_time) = now;
+	            }
+	          }
+	          else if (id(this_thermostat).fan_mode == CLIMATE_FAN_HIGH)
+	          {
+	            if (id(current_fan) != 100 && can_change)
+	            {
+	              id(current_fan) = 100;
+	              auto call = id(blower_fan).turn_on();
+	              call.set_speed(100);
+	              call.perform();
+	              id(last_fan_change_time) = now;
+	            }
+	          }
+	          else
+	          {
+	            // Unknown mode, turn off
+	            if (id(blower_fan).state && can_change)
+	            {
+	              id(blower_fan).turn_off();
+	              id(current_fan) = 0;
+	              id(last_fan_change_time) = now;
+	              ESP_LOGD("custom", "Unknown fan mode, turning off");
+	            }
+	          }
+	
+	          // Diagnostic
+	          if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO && id(blower_fan).state)
+	          {
+	            id(fan_speed_diagnostic).publish_state(id(blower_fan).speed);
+	          }
+	          ESP_LOGD("custom", "Exited update_fan_speed, current_fan %d, diff %.1f, can_change %d",
+	            id(current_fan), (double)id(diff), can_change);
+          }  //if (id(purge_blower) == 0)
 
   # Update the Status Light
   - id: status_light_update
