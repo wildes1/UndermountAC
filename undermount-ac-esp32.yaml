@@ -1439,7 +1439,7 @@ script:
       - logger.log:
           format: "Called update_fan_speed script"
       - lambda: |-
-          const int MIN_BLOWER_WHEN_COMPRESSOR = 20;
+          const int MIN_BLOWER_WHEN_COMPRESSOR = 1;
           if (id(purge_blower) == 0)
           {
             if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO)
@@ -1526,7 +1526,7 @@ script:
                         id(fan_raise_temp) = id(supplemental_diff) + ${fan_hysteresis};
                       }
                       id(current_fan) -= 20; //Decrease fan speed
-                      ESP_LOGD("custom", "current_fan > 19, decrease");
+                      ESP_LOGD("custom", "current_fan > 19, decrease unless at minimum");
                     }
                     else
                     {
@@ -1599,7 +1599,7 @@ script:
                 ESP_LOGD("custom", "Should not get here, Turning fan off");
               }
             }
-            
+
             ESP_LOGD("fan_script", "Update fan speed script - calling fan_speed_diagnostic script");
             if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO && id(blower_fan).state) 
             {
