@@ -27,6 +27,7 @@
 ##  050826 - Cleanup, actually call floor temp limit script added on 030326 at state changes, move UAC compressor power relay from an external relay to output 5
 ##  051126 - Refactor to eliminate blower turning off while compressor is on (ai assisted)
 ##  051826 - Added purge_blower variable as the blower was being started and stopped prematurely by the fan speed script
+##  061326 - modbus no longer supports role:server so commented it out, added hvac_fan_purge_delay
 ##
 ##
 ##    HVAC Enable slow_pwm switch: on enables slow PWM behavior similar to described below, off disables slow PWM, burner is on constantly when heat is called
@@ -67,6 +68,7 @@ substitutions:
   hvac_cool_deadband: "0.25"
   hvac_heat_overrun: "0.56" #1 deg F
   hvac_heat_deadband: "0.0" #0 deg F so it starts 50% duty cycle at setpoint
+  hvac_fan_purge_delay: "2 min" #delay from cooling/heating to off
 
   # Water Heater Timeout value in minutes (when turned on, it will turn off after this timeout)
   water_heat_timeout: "30"
@@ -123,6 +125,7 @@ logger:
 api:
   encryption:
     key: ${encryption_key}
+  reboot_timeout: 0s
 
 ota:
   - platform: esphome
@@ -133,17 +136,22 @@ wifi:
   password: ${wifi_password}
 
   domain: .lan
-
+  reboot_timeout: 0s
+  
   # Enable fallback hotspot (captive portal) in case wifi connection fails
   ap:
     ssid: $fallback_hotspot_name
     password: ${ac_control_backup_wifi_pw}
+  
 
 ## In combination with the `ap` this allows the user
 ## to provision wifi credentials to the device.
 captive_portal:
 
-
+# Hosts the interactive control webpage
+web_server:
+  port: 80
+  
 ##########################################################
 # Most projects should not remove anything from above here
 # and should just modify the name, project name/version 
@@ -155,6 +163,15 @@ captive_portal:
 improv_serial:
 
 globals:
+  
+# =========================================================
+# CRC16 helper (Modbus RTU polynomial 0xA001)
+# =========================================================
+  - id: modbus_crc_dummy
+    type: int
+    restore_value: no
+    initial_value: '0'
+    
   - id: last_floor  #last valid (under 84.0C) floor temp measured
     type: float
     restore_value: no
@@ -293,6 +310,21 @@ globals:
     restore_value: no
     initial_value: "0"
 
+  - id: hvac_power_requested
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: fan_only_requested
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: purge_hold_fan_speed
+    type: int
+    restore_value: no
+    initial_value: "0"
+    
 ##########################################################
 #Modbus stuff to read and write DFRobot FIT0827 (CSIO-404)
 ##########################################################
@@ -319,7 +351,7 @@ uart:
 modbus:
   - uart_id: uart_modbus_server
     id: modbus_server
-    role: server
+    # role: server
     # send_wait_time: 200ms
     send_wait_time: 600ms
     turnaround_time: 100ms
@@ -473,6 +505,11 @@ output:
       # - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
       # - switch.turn_off: diesel_burner
 
+  
+
+
+
+      
 # output pin for fan voltage - is managed by the Fan PWM output
 power_supply:
   - id: fan_voltage
@@ -605,7 +642,7 @@ sensor:
   - platform: combination
     type: median
     sources:
-      - source: onboard_temperature
+#      - source: onboard_temperature
       - source: dr_temp
       - source: pass_temp
     name: "Median Cabin Temperature"
@@ -614,7 +651,7 @@ sensor:
   - platform: combination
     type: min
     sources:
-      - source: onboard_temperature
+#      - source: onboard_temperature
       - source: dr_temp
       - source: pass_temp
     name: "Minimum Cabin Temperature"
@@ -623,7 +660,7 @@ sensor:
   - platform: combination
     type: max
     sources:
-      - source: onboard_temperature
+#      - source: onboard_temperature
       - source: dr_temp
       - source: pass_temp
     name: "Maximum Cabin Temperature"
@@ -679,150 +716,65 @@ switch:
 ##########################################################
 #Modbus stuff to read and write DFRobot FIT0827 (CSIO-404)
 ##########################################################
-  # Diesel Burner control
-  # uses diesel_burner_state to turn on and off as it seems more stable than using "x" for switch state, had several instances of turning on then off for one second
-  - platform: modbus_controller
+ # Diesel Burner control
+ # uses diesel_burner_state to turn on and off as it seems more stable than using "x" for switch state, had several instances of turning on then off for one second
+  - platform: template
     id: diesel_burner
-    modbus_controller_id: csio_1
     name: "Diesel Burner Control"
-    # Relay 1, address 0
-    #address: 0 #0:relay1 1:relay2 ...
-    #register_type: coil
-    bitmask: 0x1
-    # custom command with no payload gets rid of "function code: 0x1 exception: 2" error
-    custom_command: [ ]
-    # implement using write_lambda
-    write_lambda: |-
-      payload.push_back(0xfe);  // device address
-      payload.push_back(0x5);  // force single coil
-      payload.push_back(0x00); // high byte address of the coil
-      payload.push_back(0x00);  // low byte address of the coil
-      // if (x)
-      if (id(diesel_burner_state) == 1) 
-      {
-        // id(diesel_burner_state) = 1;
-        id(diesel_burner).publish_state(true);
-        payload.push_back(0xff); // ON
-        payload.push_back(0x00);  //Rest of ON or OFF
-        return 1;
-      }
-      else 
-      {
-        // id(diesel_burner_state) = 0;
-        id(diesel_burner).publish_state(false);
-        payload.push_back(0x00); // OFF
-        payload.push_back(0x00);  //Rest of ON or OFF
-        return 0;
-      }
+    turn_on_action:
+      - lambda: |-
+          id(diesel_burner_state) = 1;
+      - script.execute: diesel_burner_write
+
+    turn_off_action:
+      - lambda: |-
+          id(diesel_burner_state) = 0;
+      - script.execute: diesel_burner_write
+        
 ##########################################################
   # Heat Coil Bypass Valve
   # uses heat_coil_bypass_state to turn on and off as it seems more stable than using "x" for switch state, had several instances of turning on then off for one second
-  - platform: modbus_controller
+  - platform: template
     id: heat_coil_bypass
-    modbus_controller_id: csio_1
     name: "Heat Coil Bypass (Off = Goes through Heat Coil)"
-    # Relay 2, address 1
-    #address: 1 #0:relay1 1:relay2 ...
-    #register_type: coil
-    bitmask: 0x1
-    # custom command with no payload gets rid of "function code: 0x1 exception: 2" error
-    custom_command: [ ]
-    # implement using write_lambda
-    write_lambda: |-
-      payload.push_back(0xfe);  // device address
-      payload.push_back(0x5);  // force single coil
-      payload.push_back(0x00); // high byte address of the coil
-      payload.push_back(0x01);  // low byte address of the coil
-      // if (x)
-      if (id(heat_coil_bypass_state) == 1) 
-      {
-        // id(heat_coil_bypass_state) = 1; 
-        id(heat_coil_bypass).publish_state(true);
-        payload.push_back(0xff); // ON
-        payload.push_back(0x00);  //Rest of ON or OFF
-        return 1;
-      }
-      else 
-      {
-        // id(heat_coil_bypass_state) = 0; 
-        payload.push_back(0x00); // OFF
-        payload.push_back(0x00);  //Rest of ON or OFF
-        id(heat_coil_bypass).publish_state(false);
-        return 0;
-      }
+    turn_on_action:
+      - lambda: |-
+          id(heat_coil_bypass_state) = 1;
+      - script.execute: heat_coil_bypass_write
+
+    turn_off_action:
+      - lambda: |-
+          id(heat_coil_bypass_state) = 0;
+      - script.execute: heat_coil_bypass_write
+        
 ##########################################################
   # Floor Pump control
   # uses floor_pump_state to turn on and off as it seems more stable than using "x" for switch state, had several instances of turning on then off for one second
-  - platform: modbus_controller
+  - platform: template
     id: floor_pump
-    modbus_controller_id: csio_1
     name: "Floor Pump Control"
-    # Relay 3, address 2
-    #address: 2 #0:relay1 1:relay2 ...
-    #register_type: coil
-    bitmask: 0x1
-    # custom command with no payload gets rid of "function code: 0x1 exception: 2" error
-    custom_command: [ ]
-    # implement using write_lambda
-    write_lambda: |-
-      payload.push_back(0xfe);  // device address
-      payload.push_back(0x5);  // force single coil
-      payload.push_back(0x00); // high byte address of the coil
-      payload.push_back(0x02);  // low byte address of the coil
-      // if (x)
-      if (id(floor_pump_state) == 1) 
-      {
-        // id(floor_pump_state) = 1;
-        id(floor_pump).publish_state(true);
-        payload.push_back(0xff); // ON
-        payload.push_back(0x00);  //Rest of ON or OFF
-        return 1;
-      }
-      else 
-      {
-        // id(floor_pump_state) = 0;
-        id(floor_pump).publish_state(false);
-        payload.push_back(0x00); // OFF
-        payload.push_back(0x00);  //Rest of ON or OFF
-        return 0;
-      }
+    turn_on_action:
+      - lambda: |-
+          id(floor_pump_state) = 1;
+      - script.execute: floor_pump_write
+
+    turn_off_action:
+      - lambda: |-
+          id(floor_pump_state) = 0;
+      - script.execute: floor_pump_write
 
 ##########################################################
   # Hot Water Recirc control
   # does not use uses hot_water_recirc_state to turn on and off as it must be controlled by HA user as well and we will tolerate on/off/on...
-  - platform: modbus_controller
+  - platform: template
     id: hot_water_recirc
-    modbus_controller_id: csio_1
     name: "Hot Water Recirc Control"
-    # Relay 4, address 3
-    #address: 3 #0:relay1 1:relay2 ...
-    #register_type: coil
-    bitmask: 0x1
-    # custom command with no payload gets rid of "function code: 0x1 exception: 2" error
-    custom_command: [ ]
-    # implement using write_lambda
-    write_lambda: |-
-      payload.push_back(0xfe);  // device address
-      payload.push_back(0x5);  // force single coil
-      payload.push_back(0x00); // high byte address of the coil
-      payload.push_back(0x03);  // low byte address of the coil
-      if (x)
-      // if (id(hot_water_recirc_state) == 1) 
-      {
-        // id(hot_water_recirc_state) = 1;
-        id(hot_water_recirc).publish_state(true);
-        payload.push_back(0xff); // ON
-        payload.push_back(0x00);  //Rest of ON or OFF
-        return 1;
-      }
-      else 
-      {
-        // id(hot_water_recirc_state) = 0;
-        id(hot_water_recirc).publish_state(false);
-        payload.push_back(0x00); // OFF
-        payload.push_back(0x00);  //Rest of ON or OFF
-        return 0;
-      }
+
+    turn_on_action:
+      - script.execute: hot_water_recirc_on
+
+    turn_off_action:
+      - script.execute: hot_water_recirc_off
 
 ##########################################################
 ##########################################################
@@ -931,6 +883,9 @@ fan:
 ##########################################################
 ##########################################################
 ##########################################################
+##########################################################
+##########################################################
+##########################################################
 climate:
 ##########################################################
   - platform: thermostat
@@ -998,6 +953,7 @@ climate:
       - lambda: id(climate_action) = 3;
       - logger.log:
           format: "Called heat_action"
+
     cool_action:
       - lambda: id(supplemental_enabled).turn_off(); //Make sure we start with supplemental off
       # set min and max fan speeds for normal operation - to protect equipment
@@ -1038,7 +994,11 @@ climate:
             - switch.turn_on: heat_coil_bypass
       # - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
       # - switch.turn_on: heat_coil_bypass
-      - lambda: id(purge_blower) = 1;
+
+      - lambda: |-
+          id(purge_blower) = 1;
+          id(purge_hold_fan_speed) = id(current_fan);
+      # CHANGED: preserve fan speed during purge by saving it before the AC transition
       - switch.turn_off: compressor_speed_high
       - delay: 1s
       - switch.turn_on: uac_power      
@@ -1052,6 +1012,7 @@ climate:
       
       - fan.turn_on: blower_fan
       - lambda: id(purge_blower) = 0;
+      # CHANGED: purge is over; fan may resume normal control from current_fan
       - lambda: id(current_fan) = 1;
       - lambda: id(fan_lower_temp) = ${supplemental_cooling_diff} - ${fan_hysteresis};
       - lambda: id(fan_raise_temp) = ${supplemental_cooling_diff} + ${fan_hysteresis};
@@ -1059,6 +1020,7 @@ climate:
       - lambda: id(climate_action) = 2;
       - logger.log:
           format: "Called cool_action"
+
     idle_action:
       - if:
           condition:
@@ -1093,25 +1055,37 @@ climate:
             - switch.turn_off: floor_pump
       # - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
       # - switch.turn_off: floor_pump
-      - lambda: id(purge_blower) = 1;
+      - lambda: |-
+          id(purge_blower) = 1;
+          id(purge_hold_fan_speed) = id(current_fan);
+      # CHANGED: start purge, but do not drop uac_power yet
       - switch.turn_off: air_cond
       - switch.turn_off: compressor_speed_high
       - logger.log:
           format: "Called air_cond off - idle_action"
       ##- lambda: id(blower_pwm).set_max_power(0.40); # ramp down fan
-      - delay: 60s # delay before turning fan off to push out any final cold air
+      - delay: ${hvac_fan_purge_delay} # delay before turning fan off to push out any final cold/hot air
       - fan.turn_off: blower_fan
       - lambda: id(purge_blower) = 0;
       - logger.log:
           format: "Called blower_fan off - idle_action"
       - delay: 15.0s #delay 15 seconds for fan coast-down
-      - switch.turn_off: uac_power
+
+      # CHANGED: only turn off uac_power if nothing else still requests it
+      - if:
+          condition:
+            lambda: 'return id(hvac_power_requested);'
+          then:
+            - switch.turn_on: uac_power
+          else:
+            - switch.turn_off: uac_power
       - delay: 1s
       - lambda: id(climate_action) = 4;
       - logger.log:
           format: "Called idle_action"
     fan_only_action:
       - lambda: id(purge_blower) = 0;
+      # CHANGED: fan-only mode must not be treated like purge
       - if:
           condition:
             - switch.is_on: floor_pump
@@ -1159,6 +1133,7 @@ climate:
       - lambda: id(climate_action) = 6;
       - logger.log:
           format: "Called fan_only_action"
+
     off_mode:
       - logger.log:
           format: "Called climate Off Mode"
@@ -1195,12 +1170,14 @@ climate:
             - switch.turn_off: floor_pump
       # - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
       # - switch.turn_off: floor_pump
-      - lambda: id(purge_blower) = 1;
+      - lambda: |-
+          id(purge_blower) = 1;
+          id(purge_hold_fan_speed) = id(current_fan);
       - switch.turn_off: air_cond
       - switch.turn_off: compressor_speed_high
       - logger.log:
           format: "Called air_cond off - off_mode"
-      - delay: 60s
+      - delay: ${hvac_fan_purge_delay} # delay before turning fan off to push out any final cold/hot air
       - fan.turn_off: blower_fan
       - lambda: id(purge_blower) = 0;
       - logger.log:
@@ -1209,14 +1186,20 @@ climate:
       - lambda: id(blower_pwm).set_min_power(0.25);
       - lambda: id(blower_pwm).set_max_power(0.98);
       - delay: 15.0s #delay 15 seconds for fan coast-down
-      - switch.turn_off: uac_power
+      - if:
+          condition:
+            lambda: 'return id(hvac_power_requested);'
+          then:
+            - switch.turn_on: uac_power
+          else:
+            - switch.turn_off: uac_power
       - delay: 1s
       - lambda: id(climate_action) = 0;
-    
+        
     # turn the compressor to HIGH under these conditions, was 10 min and $supplemental_cooling_diff:
     set_point_minimum_differential: 0.25
     max_cooling_run_time: ${second_stage_cool_enable} 
-    supplemental_cooling_delta: ${supplemental_cooling_diff} # when the delta between target temp and current temp is > than this value (appears to only work in °C)
+    supplemental_cooling_delta: ${supplemental_cooling_diff}
     supplemental_cooling_action:
       - if:
           condition:
@@ -1224,9 +1207,10 @@ climate:
           then:
             - switch.turn_on: compressor_speed_high
       - lambda: id(supplemental_diff) = ${supplemental_cooling_diff};
+
     # heat 1st stage no fan, 2nd stage fan, fan speed determined by delta t in update_fan_speed script        
     max_heating_run_time: ${second_stage_heat_enable} 
-    supplemental_heating_delta: ${supplemental_heating_diff} # when the delta between target temp and current temp is > than this value (appears to only work in °C)
+    supplemental_heating_delta: ${supplemental_heating_diff}
     supplemental_heating_action:
       - logger.log:
           format: "Calling supplemental_heating_action (will delay 60 sec)"
@@ -1297,8 +1281,150 @@ climate:
       - script.execute: status_light_update
       - script.execute: floor_heat_temperature_limit_control
 
-
+        
 script:
+  ##########################################################
+  # Diesel Burner control — sends custom Modbus frame
+  ##########################################################
+  - id: diesel_burner_write
+    mode: queued
+    then:
+      - lambda: |-
+          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x00};
+
+          if (id(diesel_burner_state) == 1) {
+            id(diesel_burner).publish_state(true);
+            frame.push_back(0xFF);
+            frame.push_back(0x00);
+          } else {
+            id(diesel_burner).publish_state(false);
+            frame.push_back(0x00);
+            frame.push_back(0x00);
+          }
+
+          uint16_t crc = 0xFFFF;
+          for (size_t i = 0; i < frame.size(); i++) {
+            crc ^= frame[i];
+            for (int b = 0; b < 8; b++)
+              crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+          }
+          frame.push_back(crc & 0xFF);
+          frame.push_back(crc >> 8);
+
+          id(modbus_server)->write_array(frame);
+
+
+  ##########################################################
+  # Heat Coil Bypass Valve — sends custom Modbus frame
+  ##########################################################
+  - id: heat_coil_bypass_write
+    mode: queued
+    then:
+      - lambda: |-
+          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x01};
+
+          if (id(heat_coil_bypass_state) == 1) {
+            id(heat_coil_bypass).publish_state(true);
+            frame.push_back(0xFF);
+            frame.push_back(0x00);
+          } else {
+            id(heat_coil_bypass).publish_state(false);
+            frame.push_back(0x00);
+            frame.push_back(0x00);
+          }
+
+          uint16_t crc = 0xFFFF;
+          for (size_t i = 0; i < frame.size(); i++) {
+            crc ^= frame[i];
+            for (int b = 0; b < 8; b++)
+              crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+          }
+          frame.push_back(crc & 0xFF);
+          frame.push_back(crc >> 8);
+
+          id(modbus_server)->write_array(frame);
+
+
+  ##########################################################
+  # Floor Pump control — sends custom Modbus frame
+  ##########################################################
+  - id: floor_pump_write
+    mode: queued
+    then:
+      - lambda: |-
+          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x02};
+
+          if (id(floor_pump_state) == 1) {
+            id(floor_pump).publish_state(true);
+            frame.push_back(0xFF);
+            frame.push_back(0x00);
+          } else {
+            id(floor_pump).publish_state(false);
+            frame.push_back(0x00);
+            frame.push_back(0x00);
+          }
+
+          uint16_t crc = 0xFFFF;
+          for (size_t i = 0; i < frame.size(); i++) {
+            crc ^= frame[i];
+            for (int b = 0; b < 8; b++)
+              crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+          }
+          frame.push_back(crc & 0xFF);
+          frame.push_back(crc >> 8);
+
+          id(modbus_server)->write_array(frame);
+
+
+  ##########################################################
+  # Hot Water Recirc — ON command (NO _state)
+  ##########################################################
+  - id: hot_water_recirc_on
+    mode: queued
+    then:
+      - lambda: |-
+          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x03};
+
+          id(hot_water_recirc).publish_state(true);
+          frame.push_back(0xFF);
+          frame.push_back(0x00);
+
+          uint16_t crc = 0xFFFF;
+          for (size_t i = 0; i < frame.size(); i++) {
+            crc ^= frame[i];
+            for (int b = 0; b < 8; b++)
+              crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+          }
+          frame.push_back(crc & 0xFF);
+          frame.push_back(crc >> 8);
+
+          id(modbus_server)->write_array(frame);
+
+
+  ##########################################################
+  # Hot Water Recirc — OFF command (NO _state)
+  ##########################################################
+  - id: hot_water_recirc_off
+    mode: queued
+    then:
+      - lambda: |-
+          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x03};
+
+          id(hot_water_recirc).publish_state(false);
+          frame.push_back(0x00);
+          frame.push_back(0x00);
+
+          uint16_t crc = 0xFFFF;
+          for (size_t i = 0; i < frame.size(); i++) {
+            crc ^= frame[i];
+            for (int b = 0; b < 8; b++)
+              crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+          }
+          frame.push_back(crc & 0xFF);
+          frame.push_back(crc >> 8);
+
+          id(modbus_server)->write_array(frame);
+          
   - id: update_water_heater_status
     then:
       - logger.log:
@@ -1440,183 +1566,205 @@ script:
           format: "Called update_fan_speed script"
       - lambda: |-
           const int MIN_BLOWER_WHEN_COMPRESSOR = 1;
-          if (id(purge_blower) == 0)
+
+          id(fan_only_requested) =
+            (id(this_thermostat).fan_mode == CLIMATE_FAN_LOW) ||
+            (id(this_thermostat).fan_mode == CLIMATE_FAN_MEDIUM) ||
+            (id(this_thermostat).fan_mode == CLIMATE_FAN_HIGH);
+
+          id(hvac_power_requested) =
+            (id(this_thermostat).action == CLIMATE_ACTION_COOLING) ||
+            (id(this_thermostat).action == CLIMATE_ACTION_HEATING) ||
+            id(fan_only_requested) ||
+            (id(purge_blower) == 1);
+
+          if (id(purge_blower) == 1)
           {
-            if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO)
-            { 
-              if (id(this_thermostat).action == CLIMATE_ACTION_HEATING && id(this_thermostat).current_temperature < id(this_thermostat).target_temperature_low)
-                id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_low);
-              else if (id(this_thermostat).action == CLIMATE_ACTION_COOLING && id(this_thermostat).current_temperature > id(this_thermostat).target_temperature_high)
-                id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_high);
-              else
-                id(diff) = 0.;
+            if (id(blower_fan).state && id(current_fan) > 0)
+            {
+              id(purge_hold_fan_speed) = id(current_fan);
+            }
+            return;
+          }
 
-              // ===== FIX (Safety Interlock): Compressor ON -> blower must be ON and non-zero =====
-              if (id(air_cond).state)
+          if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO)
+          {
+            if (id(this_thermostat).action == CLIMATE_ACTION_HEATING && id(this_thermostat).current_temperature < id(this_thermostat).target_temperature_low)
+              id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_low);
+            else if (id(this_thermostat).action == CLIMATE_ACTION_COOLING && id(this_thermostat).current_temperature > id(this_thermostat).target_temperature_high)
+              id(diff) = fabs(id(this_thermostat).current_temperature - id(this_thermostat).target_temperature_high);
+            else
+              id(diff) = 0.0;
+
+            if (id(air_cond).state)
+            {
+              if (id(current_fan) < MIN_BLOWER_WHEN_COMPRESSOR)
+                id(current_fan) = MIN_BLOWER_WHEN_COMPRESSOR;
+
+              if (!id(blower_fan).state)
               {
-                if (id(current_fan) < MIN_BLOWER_WHEN_COMPRESSOR)
-                  id(current_fan) = MIN_BLOWER_WHEN_COMPRESSOR;
-
-                if (!id(blower_fan).state)
-                {
-                  id(blower_fan).make_call().set_speed(id(current_fan)).perform();
-                  id(blower_fan).turn_on().perform();
-                }
+                id(blower_fan).make_call().set_speed(id(current_fan)).perform();
+                id(blower_fan).turn_on().perform();
               }
+            }
 
-              if(id(blower_fan).state)
+            if (id(blower_fan).state)
+            {
+              if (id(climate_action) == 0)
               {
-                if ( id(climate_action) == 0)
+                ESP_LOGD("custom", "climate_action == 0");
+                id(fan_lower_temp) = id(supplemental_diff) - ${fan_hysteresis};
+                id(fan_raise_temp) = id(supplemental_diff) + ${fan_hysteresis};
+
+                if (!id(hvac_power_requested) && !id(fan_only_requested) && id(purge_blower) == 0)
                 {
-                  ESP_LOGD("custom", "climate_action == 0");
-                  id(fan_lower_temp) = id(supplemental_diff) - ${fan_hysteresis};
-                  id(fan_raise_temp) = id(supplemental_diff) + ${fan_hysteresis};
                   auto call = id(blower_fan).turn_off();
                   call.set_speed(0);
                   call.perform();
                   id(current_fan) = 0;
                 }
-                else 
+              }
+              else
+              {
+                if (id(diff) > id(fan_raise_temp))
                 {
-                  if (id(diff) > id(fan_raise_temp))
+                  if (id(this_thermostat).action == CLIMATE_ACTION_COOLING && id(diff) > ${supplemental_cooling_diff})
                   {
-                    // ===== FIX: removed stray semicolon + tied to real thermostat action =====
-                    if (id(this_thermostat).action == CLIMATE_ACTION_COOLING && id(diff) > ${supplemental_cooling_diff})
+                    id(supplemental_enabled).turn_on();
+                    ESP_LOGD("custom", "A/C On, supplemental cooling enable on");
+                  }
+                  if (id(current_fan) < 81)
+                  {
+                    id(fan_raise_temp) += ${fan_hysteresis} * 2;
+                    id(fan_lower_temp) += ${fan_hysteresis} * 2;
+                    if (id(fan_raise_temp) > 9.6)
                     {
-                      id(supplemental_enabled).turn_on(); 
-                      ESP_LOGD("custom", "A/C On, supplemental cooling enable on");
+                      id(fan_raise_temp) = 9.6;
+                      id(fan_lower_temp) = 9.3;
                     }
-                    if (id(current_fan) < 81)
+                    id(current_fan) += 20;
+                    ESP_LOGD("custom", "current_fan < 81, increase");
+                  }
+                  else
+                  {
+                    id(current_fan) = 100;
+                    ESP_LOGD("custom", "current_fan increase 100");
+                  }
+
+                  auto call = id(blower_fan).make_call();
+                  call.set_speed(id(current_fan));
+                  call.perform();
+                }
+                else if (id(diff) < id(fan_lower_temp))
+                {
+                  if (id(this_thermostat).action == CLIMATE_ACTION_COOLING && id(diff) < (${supplemental_cooling_diff} - 0.25))
+                  {
+                    id(supplemental_enabled).turn_off();
+                    ESP_LOGD("custom", "A/C On, supplemental cooling enable off");
+                  }
+
+                  if (id(current_fan) > 19)
+                  {
+                    id(fan_lower_temp) -= ${fan_hysteresis} * 2;
+                    id(fan_raise_temp) -= ${fan_hysteresis} * 2;
+                    if (id(fan_lower_temp) < 2.0)
                     {
-                      id(fan_raise_temp) += ${fan_hysteresis} * 2;
-                      id(fan_lower_temp) += ${fan_hysteresis} * 2;
-                      if (id(fan_raise_temp) > 9.6)
-                      {
-                        id(fan_raise_temp) = 9.6;
-                        id(fan_lower_temp)  = 9.3;
-                      }
-                      id(current_fan) += 20; //Increase fan speed
-                      ESP_LOGD("custom", "current_fan < 81, increase");
+                      id(fan_lower_temp) = id(supplemental_diff) - ${fan_hysteresis};
+                      id(fan_raise_temp) = id(supplemental_diff) + ${fan_hysteresis};
+                    }
+                    id(current_fan) -= 20;
+                    ESP_LOGD("custom", "current_fan > 19, decrease unless at minimum");
+                  }
+                  else
+                  {
+                    id(current_fan) = 0;
+                    ESP_LOGD("custom", "current_fan decrease 0");
+                  }
+
+                  if (id(current_fan) == 0)
+                  {
+                    if (id(air_cond).state)
+                    {
+                      id(current_fan) = MIN_BLOWER_WHEN_COMPRESSOR;
+                      id(blower_fan).make_call().set_speed(id(current_fan)).perform();
+                      id(blower_fan).turn_on().perform();
                     }
                     else
                     {
-                      id(current_fan) = 100; //Increase fan speed
-                      ESP_LOGD("custom", "current_fan increase 100");
-
+                      if (id(blower_fan).state)
+                      {
+                        auto call = id(blower_fan).turn_off();
+                        call.set_speed(0);
+                        call.perform();
+                      }
                     }
+                  }
+                  else
+                  {
                     auto call = id(blower_fan).make_call();
                     call.set_speed(id(current_fan));
                     call.perform();
                   }
-                  else if (id(diff) < id(fan_lower_temp))
-                  {
-                    // ===== FIX: removed stray semicolon + tied to real thermostat action =====
-                    if (id(this_thermostat).action == CLIMATE_ACTION_COOLING && id(diff) < (${supplemental_cooling_diff}-0.25))
-                    {
-                      id(supplemental_enabled).turn_off(); 
-                      ESP_LOGD("custom", "A/C On, supplemental cooling enable off");
-                    }
-                    if (id(current_fan) > 19)
-                    {
-                      id(fan_lower_temp) -= ${fan_hysteresis} * 2;
-                      id(fan_raise_temp) -= ${fan_hysteresis} * 2;
-                      if (id(fan_lower_temp) < 2.0)
-                      {
-                        id(fan_lower_temp) = id(supplemental_diff) - ${fan_hysteresis};
-                        id(fan_raise_temp) = id(supplemental_diff) + ${fan_hysteresis};
-                      }
-                      id(current_fan) -= 20; //Decrease fan speed
-                      ESP_LOGD("custom", "current_fan > 19, decrease unless at minimum");
-                    }
-                    else
-                    {
-                      id(current_fan) = 0;
-                      ESP_LOGD("custom", "current_fan decrease 0");
-                    }
-
-                    //If the fan speed is in between, leave it the same
-                    
-                    //Actually set the fan speed  
-                    if (id(current_fan) == 0)
-                    {
-                      // ===== FIX (Safety Interlock): prevent blower OFF while compressor ON =====
-                      if (id(air_cond).state)
-                      {
-                        id(current_fan) = MIN_BLOWER_WHEN_COMPRESSOR;
-                        id(blower_fan).make_call().set_speed(id(current_fan)).perform();
-                        id(blower_fan).turn_on().perform();
-                      }
-                      else
-                      {
-                        if (id(blower_fan).state)
-                        {
-                          auto call = id(blower_fan).turn_off();
-                          call.set_speed(0);
-                          call.perform();
-                        }
-                      }
-                    }
-                    else
-                    {
-                      auto call = id(blower_fan).make_call();
-                      call.set_speed(id(current_fan));
-                      call.perform();
-                    }
-                  }
-                  //otherwise leave fan speed the same
                 }
               }
             }
-            else if (id(this_thermostat).fan_mode == CLIMATE_FAN_LOW)
+          }
+          else if (id(this_thermostat).fan_mode == CLIMATE_FAN_LOW)
+          {
+            id(current_fan) = 15;
+            if (!id(blower_fan).state)
+              id(blower_fan).turn_on().perform();
+            auto call = id(blower_fan).make_call();
+            call.set_speed(15);
+            call.perform();
+          }
+          else if (id(this_thermostat).fan_mode == CLIMATE_FAN_MEDIUM)
+          {
+            id(current_fan) = 40;
+            if (!id(blower_fan).state)
+              id(blower_fan).turn_on().perform();
+            auto call = id(blower_fan).make_call();
+            call.set_speed(40);
+            call.perform();
+          }
+          else if (id(this_thermostat).fan_mode == CLIMATE_FAN_HIGH)
+          {
+            id(current_fan) = 100;
+            if (!id(blower_fan).state)
+              id(blower_fan).turn_on().perform();
+            auto call = id(blower_fan).make_call();
+            call.set_speed(100);
+            call.perform();
+          }
+          else
+          {
+            if (id(blower_fan).state)
             {
-                id(current_fan) = 15;
-                auto call = id(blower_fan).turn_on();
-                call.set_speed(15);
-                call.perform();
+              auto call = id(blower_fan).turn_off();
+              call.set_speed(0);
+              call.perform();
+              id(current_fan) = 0;
+              ESP_LOGD("custom", "Should not get here, Turning fan off");
             }
-            else if (id(this_thermostat).fan_mode == CLIMATE_FAN_MEDIUM)
-            {
-                id(current_fan) = 40;
-                auto call = id(blower_fan).turn_on();
-                call.set_speed(40);
-                call.perform();
-            }
-            else if (id(this_thermostat).fan_mode == CLIMATE_FAN_HIGH)
-            {
-                id(current_fan) = 100;
-                auto call = id(blower_fan).turn_on();
-                call.set_speed(100);
-                call.perform();
-            }
-            else  //should not get here!!!
-            {
-              if (id(blower_fan).state)  //If fan is on and it should be off
-              {
-                auto call = id(blower_fan).turn_off();
-                call.set_speed(0);
-                call.perform();
-                id(current_fan) = 0;
-                ESP_LOGD("custom", "Should not get here, Turning fan off");
-              }
-            }
+          }
 
-            ESP_LOGD("fan_script", "Update fan speed script - calling fan_speed_diagnostic script");
-            if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO && id(blower_fan).state) 
-            {
-              id(fan_speed_diagnostic).publish_state(id(blower_fan).speed);
-            }
-            ESP_LOGD("custom", "Exited update_fan_speed, current_fan %.1f, fan_raise_temp %.1f, fan_lower_temp %.1f, climate_action %1d, \ncurrent_temperature %1f, target_temperature_high %1f, target_temperature_low %1f, diff %1f",
-              (double)id(current_fan),
-              (double)id(fan_raise_temp),
-              (double)id(fan_lower_temp),
-              (int)id(climate_action),
-              (double)id(this_thermostat).current_temperature,
-              (double)id(this_thermostat).target_temperature_high,
-              (double)id(this_thermostat).target_temperature_low,
-              (double)id(diff)
-            );
-          }  //if (id(purge_blower) == 0)
-
+          ESP_LOGD("fan_script", "Update fan speed script - calling fan_speed_diagnostic script");
+          if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO && id(blower_fan).state)
+          {
+            id(fan_speed_diagnostic).publish_state(id(blower_fan).speed);
+          }
+          ESP_LOGD("custom", "Exited update_fan_speed, current_fan %.1f, fan_raise_temp %.1f, fan_lower_temp %.1f, climate_action %1d, \
+            current_temperature %1f, target_temperature_high %1f, target_temperature_low %1f, diff %1f",
+            (double)id(current_fan),
+            (double)id(fan_raise_temp),
+            (double)id(fan_lower_temp),
+            (int)id(climate_action),
+            (double)id(this_thermostat).current_temperature,
+            (double)id(this_thermostat).target_temperature_high,
+            (double)id(this_thermostat).target_temperature_low,
+            (double)id(diff)
+          );
+          
   # Update the Status Light
   - id: status_light_update
     then:
