@@ -28,6 +28,7 @@
 ##  051126 - Refactor to eliminate blower turning off while compressor is on (ai assisted)
 ##  051826 - Added purge_blower variable as the blower was being started and stopped prematurely by the fan speed script
 ##  061326 - modbus no longer supports role:server so commented it out, added hvac_fan_purge_delay
+##  110726 - Implemented auto selection of min or max temp based on mode, also added Verbose debug logging which switches between debug and info
 ##
 ##
 ##    HVAC Enable slow_pwm switch: on enables slow PWM behavior similar to described below, off disables slow PWM, burner is on constantly when heat is called
@@ -89,13 +90,22 @@ esphome:
   # Automatically add the mac address to the name
   # so you can use a single firmware for all devices
   name_add_mac_suffix: false
+  
   on_boot:
-    priority: -100
-    then:
-      output.set_level:
-        id: diesel_burner_slow_pwm
-        level: 0%
-#  # This will allow for (future) project identification,
+    # 1. Early stage actions (Priority -100 runs early in the boot cycle)
+    - priority: -100
+      then:
+        - output.set_level:
+            id: diesel_burner_slow_pwm
+            level: 0%
+
+    # 2. Late stage actions (Priority 100.0 runs after all components are ready)
+    - priority: 100.0
+      then:
+        - globals.set:
+            id: system_ready
+            value: 'true'
+        - component.update: selected_cabin_temp
 #  # configuration and updates. Also needed for dashboard_import below
 #  project:
 #    name: wildes1.undermount-ac
@@ -109,7 +119,8 @@ esp32:
 
 # To be able to get logs from the device via serial and api.
 logger:
-  level: DEBUG  #dEBUG to debug, INFO to remove all debug messages
+  id: esphome_logger
+  level: DEBUG # The highest level you want available at runtime
   
 ## This should point to the public location of this yaml file.
 #dashboard_import:
@@ -129,7 +140,8 @@ api:
 
 ota:
   - platform: esphome
-    password: ${ota_pw}
+    encryption:
+#    password: ${ota_pw}
 
 wifi:
   ssid: ${wifi_ssid}
@@ -137,6 +149,7 @@ wifi:
 
   domain: .lan
   reboot_timeout: 0s
+  fast_connect: true
   
   # Enable fallback hotspot (captive portal) in case wifi connection fails
   ap:
@@ -151,6 +164,10 @@ captive_portal:
 # Hosts the interactive control webpage
 web_server:
   port: 80
+  auth:
+    type: digest
+    username: "hvac"
+    password: ${ota_pw}
   
 ##########################################################
 # Most projects should not remove anything from above here
@@ -163,7 +180,16 @@ web_server:
 improv_serial:
 
 globals:
-  
+  - id: last_hvac_mode
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: system_ready
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+ 
 # =========================================================
 # CRC16 helper (Modbus RTU polynomial 0xA001)
 # =========================================================
@@ -265,26 +291,6 @@ globals:
     restore_value: no
     initial_value: "0"
 
-  - id: diesel_burner_state #on when 1 - calling for stage 1, 2 - calling for stage 2, 3 - calling for hot water
-    type: int
-    restore_value: no
-    initial_value: "0"
-
-  - id: heat_coil_bypass_state #0 or off = through heat coil, 1 = on = bypass heat coil
-    type: int
-    restore_value: no
-    initial_value: "1"
-
-  - id: floor_pump_state #on when 1 - stage 1 heat, use with diesel burner, will have cutout based on floor temp
-    type: int
-    restore_value: no
-    initial_value: "0"
-
-  # - id: hot_water_recirc_state #on when 1 - recirculate hot water back to fresh tank
-  #   type: int
-  #   restore_value: no
-  #   initial_value: "0"
-
   - id: climate_action #0 = off, 2 = cool, 3 = heat, 6 = fan only, 4 = idle
     type: int
     restore_value: no
@@ -377,7 +383,7 @@ light:
   #   variant: WS2812
   - platform: esp32_rmt_led_strip #variant not supported, also ...order is a required ooption
     chipset: WS2812
-    rgb_order: RGB
+    channel_colors: RGB
     pin: 48
     num_leds: 1
     name: "Status LED RGB"
@@ -482,34 +488,25 @@ output:
     turn_on_action:
       - logger.log:
           format: "Called slow_pwm turn_on"
-      # - lambda: if (id(diesel_burner_state) == 0) { id(diesel_burner_state) = 1; id(diesel_burner).turn_on(); }
       - if:
           condition:
-            - switch.is_off: diesel_burner
-          then:              
-            - lambda: id(diesel_burner_state) = 1; //Set state to on for diesel burner
-            - switch.turn_on: diesel_burner
-      # - lambda: id(diesel_burner_state) = 1; //Set state to on for diesel burner
-      # - switch.turn_on: diesel_burner
+            lambda: return id(purge_blower) == 0;
+          then:
+            - if:
+                condition:
+                  - switch.is_off: diesel_burner
+                then:
+                  - switch.turn_on: diesel_burner
 
     turn_off_action:
       - logger.log:
           format: "Called slow_pwm turn_off"
-      # - lambda: if (id(diesel_burner_state) == 1) { id(diesel_burner_state) = 0; id(diesel_burner).turn_off(); }
       - if:
           condition:
             - switch.is_on: diesel_burner
           then:              
-            - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
             - switch.turn_off: diesel_burner
-      # - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
-      # - switch.turn_off: diesel_burner
 
-  
-
-
-
-      
 # output pin for fan voltage - is managed by the Fan PWM output
 power_supply:
   - id: fan_voltage
@@ -530,6 +527,11 @@ one_wire:
     pin: 13
 
 sensor:
+  - platform: template
+    id: climate_action_sensor
+    name: "Climate Action State"
+    lambda: return id(climate_action);
+    
   # One Wire floor temp sensor
   - platform: dallas_temp
     address: ${one_wire_address}
@@ -666,15 +668,18 @@ sensor:
     name: "Maximum Cabin Temperature"
     id: maximum_cabin_temp
 
-# Selects one of the above combination temperatures depending on thermostat mode
+  # Selects one of the above combination temperatures depending on thermostat mode
   - platform: template
+    name: "Selected Cabin Temperature"
+    id: selected_cabin_temp
     lambda: |-
       if (id(this_thermostat).mode == CLIMATE_MODE_COOL)
         return id(minimum_cabin_temp).state;
       else  //Heating and auto
         return id(maximum_cabin_temp).state;
-    name: "Selected Cabin Temperature"
-    id: selected_cabin_temp
+    # Add this filters block to break the loop:
+    filters:
+      - delta: 0.05
 
   # fan speed diagnostics sensor
   - platform: template
@@ -713,55 +718,61 @@ sensor:
 #          }
 
 switch:
+  - platform: template
+    name: "Verbose Debug Logging"
+    id: verbose_logging_switch
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    
+    turn_on_action:
+      - lambda: |-
+          // Simply pass the log level directly without a component tag string
+          id(esphome_logger).set_log_level(ESPHOME_LOG_LEVEL_DEBUG);
+          ESP_LOGI("logger", "Runtime global log level raised to DEBUG.");
+          
+    turn_off_action:
+      - lambda: |-
+          // Lower the global log level to suppress routine updates
+          id(esphome_logger).set_log_level(ESPHOME_LOG_LEVEL_WARN);
+          ESP_LOGW("logger", "Runtime global log level dropped to WARN.");
+          
 ##########################################################
 #Modbus stuff to read and write DFRobot FIT0827 (CSIO-404)
 ##########################################################
- # Diesel Burner control
- # uses diesel_burner_state to turn on and off as it seems more stable than using "x" for switch state, had several instances of turning on then off for one second
+  # Diesel Burner control
+  # Previously used diesel_burner_state for stability; now scripts publish state directly
   - platform: template
     id: diesel_burner
     name: "Diesel Burner Control"
     turn_on_action:
-      - lambda: |-
-          id(diesel_burner_state) = 1;
-      - script.execute: diesel_burner_write
+      - script.execute: diesel_burner_on
 
     turn_off_action:
-      - lambda: |-
-          id(diesel_burner_state) = 0;
-      - script.execute: diesel_burner_write
+      - script.execute: diesel_burner_off
         
 ##########################################################
   # Heat Coil Bypass Valve
-  # uses heat_coil_bypass_state to turn on and off as it seems more stable than using "x" for switch state, had several instances of turning on then off for one second
+  # Previously used heat_coil_bypass_state for stability; now scripts publish state directly
   - platform: template
     id: heat_coil_bypass
     name: "Heat Coil Bypass (Off = Goes through Heat Coil)"
     turn_on_action:
-      - lambda: |-
-          id(heat_coil_bypass_state) = 1;
-      - script.execute: heat_coil_bypass_write
+      - script.execute: heat_coil_bypass_on
 
     turn_off_action:
-      - lambda: |-
-          id(heat_coil_bypass_state) = 0;
-      - script.execute: heat_coil_bypass_write
+      - script.execute: heat_coil_bypass_off
         
 ##########################################################
   # Floor Pump control
-  # uses floor_pump_state to turn on and off as it seems more stable than using "x" for switch state, had several instances of turning on then off for one second
+  # Previously used floor_pump_state for stability; now scripts publish state directly
   - platform: template
     id: floor_pump
     name: "Floor Pump Control"
     turn_on_action:
-      - lambda: |-
-          id(floor_pump_state) = 1;
-      - script.execute: floor_pump_write
+      - script.execute: floor_pump_on
 
     turn_off_action:
-      - lambda: |-
-          id(floor_pump_state) = 0;
-      - script.execute: floor_pump_write
+      - script.execute: floor_pump_off
 
 ##########################################################
   # Hot Water Recirc control
@@ -877,8 +888,8 @@ fan:
             - switch.turn_off: air_cond
     on_speed_set:
       - lambda: id(fan_speed_diagnostic).publish_state(id(blower_fan).speed);
-      - logger.log:
-          format: "Called fan on_speed_set"
+      - script.execute: update_fan_speed
+      - logger.log: "Called fan on_speed_set"
 
 ##########################################################
 ##########################################################
@@ -891,7 +902,7 @@ climate:
   - platform: thermostat
     name: "Thermostat"
     id: this_thermostat
-    sensor: minimum_cabin_temp # maximum_cabin_temp # for winter # minimum_cabin_temp #for summer
+    sensor: selected_cabin_temp #maximum_cabin_temp # maximum_cabin_temp # for winter # minimum_cabin_temp #for summer
     visual:
       temperature_step:
         target_temperature: 1
@@ -924,28 +935,25 @@ climate:
       - delay: 1s
       - switch.turn_on: uac_power      
       - delay: 2s
-      - lambda: id(floor_pump_state) = 1; //Set state to on for floor pump
       - switch.turn_on: floor_pump
       - if:
           condition:
             - switch.is_on: water_heater
           then:
             # Turn on Boiler regardless of heat call
-            - lambda: id(diesel_burner_state) = 1;
             - switch.turn_on: diesel_burner
           else:
             - if:
                 condition:
                   - switch.is_off: slow_pwm_enabled
                 then:
-                  - lambda: id(diesel_burner_state) = 1;
                   - switch.turn_on: diesel_burner
                 else:
                   - lambda: id(diesel_burner_slow_pwm_val) = 0.5;
                   - output.set_level:
                       id: diesel_burner_slow_pwm
                       level: 50%
-                  - logger.log: "Called heat action output_set_level 50%, diesel_burner_slow_pwm_val should be 0.5"
+                  - logger.log: "Called heat action output_set_level 50%%, diesel_burner_slow_pwm_val should be 0.5"
       - delay: 20s
       - lambda: id(fan_lower_temp) = ${supplemental_heating_diff} - ${fan_hysteresis};
       - lambda: id(fan_raise_temp) = ${supplemental_heating_diff} + ${fan_hysteresis};
@@ -963,23 +971,18 @@ climate:
           condition:
             - switch.is_on: floor_pump
           then:              
-            - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
             - switch.turn_off: floor_pump
-      # - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
-      # - switch.turn_off: floor_pump
       - if:
           condition:
             - switch.is_on: water_heater
           then:
             # Turn on Boiler regardless of heat call
-            - lambda: id(diesel_burner_state) = 1;
             - switch.turn_on: diesel_burner
           else:
             - if:
                 condition:
                   - switch.is_off: slow_pwm_enabled
                 then:
-                  - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
                   - switch.turn_off: diesel_burner
                 else:
                   - lambda: id(diesel_burner_slow_pwm_val) = 0;
@@ -990,10 +993,7 @@ climate:
           condition:
             - switch.is_off: heat_coil_bypass
           then:              
-            - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
             - switch.turn_on: heat_coil_bypass
-      # - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
-      # - switch.turn_on: heat_coil_bypass
 
       - lambda: |-
           id(purge_blower) = 1;
@@ -1027,14 +1027,12 @@ climate:
             - switch.is_on: water_heater
           then:
             # Turn on Boiler regardless of heat call
-            - lambda: id(diesel_burner_state) = 1;
             - switch.turn_on: diesel_burner
           else:
             - if:
                 condition:
                   - switch.is_off: slow_pwm_enabled
                 then:
-                  - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
                   - switch.turn_off: diesel_burner
                 else:
                   - lambda: id(diesel_burner_slow_pwm_val) = 0;
@@ -1045,16 +1043,12 @@ climate:
           condition:
             - switch.is_off: heat_coil_bypass
           then:              
-            - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
             - switch.turn_on: heat_coil_bypass
       - if:
           condition:
             - switch.is_on: floor_pump
           then:              
-            - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
             - switch.turn_off: floor_pump
-      # - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
-      # - switch.turn_off: floor_pump
       - lambda: |-
           id(purge_blower) = 1;
           id(purge_hold_fan_speed) = id(current_fan);
@@ -1090,23 +1084,18 @@ climate:
           condition:
             - switch.is_on: floor_pump
           then:              
-            - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
             - switch.turn_off: floor_pump
-      # - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
-      # - switch.turn_off: floor_pump
       - if:
           condition:
             - switch.is_on: water_heater
           then:
             # Turn on Boiler regardless of heat call
-            - lambda: id(diesel_burner_state) = 1;
             - switch.turn_on: diesel_burner
           else:
             - if:
                 condition:
                   - switch.is_off: slow_pwm_enabled
                 then:
-                  - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
                   - switch.turn_off: diesel_burner
                 else:
                   - lambda: id(diesel_burner_slow_pwm_val) = 0;
@@ -1117,7 +1106,6 @@ climate:
           condition:
             - switch.is_off: heat_coil_bypass
           then:              
-            - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
             - switch.turn_on: heat_coil_bypass
       - switch.turn_off: air_cond
       - switch.turn_off: compressor_speed_high
@@ -1142,14 +1130,12 @@ climate:
             - switch.is_on: water_heater
           then:
             # Turn on Boiler regardless of heat call
-            - lambda: id(diesel_burner_state) = 1;
             - switch.turn_on: diesel_burner
           else:
             - if:
                 condition:
                   - switch.is_off: slow_pwm_enabled
                 then:
-                  - lambda: id(diesel_burner_state) = 0; //Set state to off for diesel burner
                   - switch.turn_off: diesel_burner
                 else:
                   - lambda: id(diesel_burner_slow_pwm_val) = 0;
@@ -1160,16 +1146,12 @@ climate:
           condition:
             - switch.is_off: heat_coil_bypass
           then:              
-            - lambda: id(heat_coil_bypass_state) = 1; //Set state to on for bypass
             - switch.turn_on: heat_coil_bypass
       - if:
           condition:
             - switch.is_on: floor_pump
           then:              
-            - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
             - switch.turn_off: floor_pump
-      # - lambda: id(floor_pump_state) = 0; //Set state to off for floor pump
-      # - switch.turn_off: floor_pump
       - lambda: |-
           id(purge_blower) = 1;
           id(purge_hold_fan_speed) = id(current_fan);
@@ -1214,7 +1196,6 @@ climate:
     supplemental_heating_action:
       - logger.log:
           format: "Calling supplemental_heating_action (will delay 60 sec)"
-      - lambda: id(heat_coil_bypass_state) = 0; //Set state to off for bypass
       - switch.turn_off: heat_coil_bypass
       - delay: 60s # delay before turning fan on so heat coil gets warm
       - fan.turn_on: blower_fan
@@ -1269,6 +1250,21 @@ climate:
 
     # when any state change occurs on the Thermostat
     on_state:
+      - if:
+          condition:
+            - lambda: |-
+                if (!id(system_ready)) return false;
+                // Only return true if the mode actually changed from last time
+                bool changed = (id(this_thermostat).mode != id(last_hvac_mode));
+                id(last_hvac_mode) = id(this_thermostat).mode;
+                return changed;
+          then:
+            - script.execute: deferred_sensor_update
+      - if:
+          condition:
+            - lambda: 'return id(system_ready);'
+          then:
+            - script.execute: deferred_sensor_update
       - logger.log:
           format: "on_state called at end of: - platform: thermostat"
       - script.execute: update_fan_speed
@@ -1280,28 +1276,26 @@ climate:
             - script.execute: update_diesel_burner_slow_pwm
       - script.execute: status_light_update
       - script.execute: floor_heat_temperature_limit_control
-
         
 script:
+  - id: deferred_sensor_update
+    mode: restart # If a new mode change arrives, reset the timer
+    then:
+      - delay: 50ms
+      - component.update: selected_cabin_temp
   ##########################################################
   # Diesel Burner control — sends custom Modbus frame
   ##########################################################
-  - id: diesel_burner_write
+  - id: diesel_burner_on
     mode: queued
     then:
       - lambda: |-
-          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x00};
+          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x00,0xFF,0x00};
 
-          if (id(diesel_burner_state) == 1) {
-            id(diesel_burner).publish_state(true);
-            frame.push_back(0xFF);
-            frame.push_back(0x00);
-          } else {
-            id(diesel_burner).publish_state(false);
-            frame.push_back(0x00);
-            frame.push_back(0x00);
-          }
+          // Publish state here (switch no longer auto‑reverts)
+          id(diesel_burner).publish_state(true);
 
+          // CRC16
           uint16_t crc = 0xFFFF;
           for (size_t i = 0; i < frame.size(); i++) {
             crc ^= frame[i];
@@ -1313,26 +1307,40 @@ script:
 
           id(modbus_server)->write_array(frame);
 
+  - id: diesel_burner_off
+    mode: queued
+    then:
+      - lambda: |-
+          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x00,0x00,0x00};
+
+          // Publish state here
+          id(diesel_burner).publish_state(false);
+
+          // CRC16
+          uint16_t crc = 0xFFFF;
+          for (size_t i = 0; i < frame.size(); i++) {
+            crc ^= frame[i];
+            for (int b = 0; b < 8; b++)
+              crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+          }
+          frame.push_back(crc & 0xFF);
+          frame.push_back(crc >> 8);
+
+          id(modbus_server)->write_array(frame);
 
   ##########################################################
   # Heat Coil Bypass Valve — sends custom Modbus frame
   ##########################################################
-  - id: heat_coil_bypass_write
+  - id: heat_coil_bypass_on
     mode: queued
     then:
       - lambda: |-
-          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x01};
+          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x01,0xFF,0x00};
 
-          if (id(heat_coil_bypass_state) == 1) {
-            id(heat_coil_bypass).publish_state(true);
-            frame.push_back(0xFF);
-            frame.push_back(0x00);
-          } else {
-            id(heat_coil_bypass).publish_state(false);
-            frame.push_back(0x00);
-            frame.push_back(0x00);
-          }
+          // Publish state here
+          id(heat_coil_bypass).publish_state(true);
 
+          // CRC16
           uint16_t crc = 0xFFFF;
           for (size_t i = 0; i < frame.size(); i++) {
             crc ^= frame[i];
@@ -1344,26 +1352,40 @@ script:
 
           id(modbus_server)->write_array(frame);
 
+  - id: heat_coil_bypass_off
+    mode: queued
+    then:
+      - lambda: |-
+          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x01,0x00,0x00};
+
+          // Publish state here
+          id(heat_coil_bypass).publish_state(false);
+
+          // CRC16
+          uint16_t crc = 0xFFFF;
+          for (size_t i = 0; i < frame.size(); i++) {
+            crc ^= frame[i];
+            for (int b = 0; b < 8; b++)
+              crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+          }
+          frame.push_back(crc & 0xFF);
+          frame.push_back(crc >> 8);
+
+          id(modbus_server)->write_array(frame);
 
   ##########################################################
   # Floor Pump control — sends custom Modbus frame
   ##########################################################
-  - id: floor_pump_write
+  - id: floor_pump_on
     mode: queued
     then:
       - lambda: |-
-          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x02};
+          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x02,0xFF,0x00};
 
-          if (id(floor_pump_state) == 1) {
-            id(floor_pump).publish_state(true);
-            frame.push_back(0xFF);
-            frame.push_back(0x00);
-          } else {
-            id(floor_pump).publish_state(false);
-            frame.push_back(0x00);
-            frame.push_back(0x00);
-          }
+          // Publish state here
+          id(floor_pump).publish_state(true);
 
+          // CRC16
           uint16_t crc = 0xFFFF;
           for (size_t i = 0; i < frame.size(); i++) {
             crc ^= frame[i];
@@ -1375,6 +1397,26 @@ script:
 
           id(modbus_server)->write_array(frame);
 
+  - id: floor_pump_off
+    mode: queued
+    then:
+      - lambda: |-
+          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x02,0x00,0x00};
+
+          // Publish state here
+          id(floor_pump).publish_state(false);
+
+          // CRC16
+          uint16_t crc = 0xFFFF;
+          for (size_t i = 0; i < frame.size(); i++) {
+            crc ^= frame[i];
+            for (int b = 0; b < 8; b++)
+              crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+          }
+          frame.push_back(crc & 0xFF);
+          frame.push_back(crc >> 8);
+
+          id(modbus_server)->write_array(frame);
 
   ##########################################################
   # Hot Water Recirc — ON command (NO _state)
@@ -1383,12 +1425,12 @@ script:
     mode: queued
     then:
       - lambda: |-
-          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x03};
+          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x03,0xFF,0x00};
 
+          // Publish state here
           id(hot_water_recirc).publish_state(true);
-          frame.push_back(0xFF);
-          frame.push_back(0x00);
 
+          // CRC16
           uint16_t crc = 0xFFFF;
           for (size_t i = 0; i < frame.size(); i++) {
             crc ^= frame[i];
@@ -1408,12 +1450,12 @@ script:
     mode: queued
     then:
       - lambda: |-
-          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x03};
+          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x03,0x00,0x00};
 
+          // Publish state here
           id(hot_water_recirc).publish_state(false);
-          frame.push_back(0x00);
-          frame.push_back(0x00);
 
+          // CRC16
           uint16_t crc = 0xFFFF;
           for (size_t i = 0; i < frame.size(); i++) {
             crc ^= frame[i];
@@ -1435,38 +1477,22 @@ script:
             // If water heater on time has not timed out
             if (id(water_heater_time_on) < ${water_heat_timeout}) 
             {
-              if (id(slow_pwm_enabled) && id(diesel_burner_slow_pwm_val) < 0.51) 
+              if (id(slow_pwm_enabled).state && id(diesel_burner_slow_pwm_val) < 0.51) 
               {
                 id(diesel_burner_slow_pwm_val) = 1.0;
                 id(diesel_burner_slow_pwm).set_level(1.0);
-                // if (!id(diesel_burner).state) //Turn on only if off
-                if (id(diesel_burner_state) == 0) //Turn on only if off
-                {
-                  id(diesel_burner_state) = 1; // Set state to on for diesel burner
+                if (!id(diesel_burner).state) //Turn on only if off
                   id(diesel_burner).turn_on();
-                }
-                ESP_LOGD("custom", "Setting PWM to 100%");
+                ESP_LOGD("custom", "Setting PWM to 100%%");
               } 
-              // if (!id(diesel_burner).state) //Turn on only if off
-              else if (id(diesel_burner_state) == 0)  //Turn on only if off
-              {
-                id(diesel_burner_state) = 1; // Set state to on for diesel burner
+              else if (!id(diesel_burner).state)  //Turn on only if off
                 id(diesel_burner).turn_on();
-              }
             } 
             else 
             {
               id(water_heater).turn_off(); // Turn water heater switch off
-              if (id(this_thermostat).action == CLIMATE_ACTION_HEATING) // Only when heating
-              { 
-                //Do nothing, we want burner on or PWM controlled
-              }
-              // else if (id(diesel_burner).state)  //Turn off only if on
-              else if (id(diesel_burner_state) == 1)  //Turn off only if on
-              {
-                id(diesel_burner_state) = 0; // Set state to off for diesel burner
+              if (id(this_thermostat).action != CLIMATE_ACTION_HEATING && id(diesel_burner).state)
                 id(diesel_burner).turn_off();
-              }
             }
           } 
           else if (id(this_thermostat).action == CLIMATE_ACTION_HEATING) // Only when heating
@@ -1475,12 +1501,8 @@ script:
           }
           else
           {
-            // if (id(diesel_burner).state)  //Turn off only if on
-            if (id(diesel_burner_state) == 1)  //Turn off only if on
-            {
-              id(diesel_burner_state) = 0; // Set state to off for diesel burner
+            if (id(diesel_burner).state)  //Turn off only if on
               id(diesel_burner).turn_off();
-            }
           }
           ESP_LOGD("custom", "Exited update_water_heater_status, water_heater: %s, time_on: %.1f", 
                     id(water_heater).state ? "ON" : "OFF", 
@@ -1501,13 +1523,9 @@ script:
               {
                 id(diesel_burner_slow_pwm_val) = 1.;
                 id(diesel_burner_slow_pwm).set_level(1.0);
-                // if (!id(diesel_burner).state) //Turn on only if off
-                if (id(diesel_burner_state) == 0) //Turn on only if off
-                {
-                  id(diesel_burner_state) = 1; // Set state to on for diesel burner
+                if (!id(diesel_burner).state) //Turn on only if off
                   id(diesel_burner).turn_on();
-                }
-                ESP_LOGD("custom", "Setting PWM to 100%");
+                ESP_LOGD("custom", "Setting PWM to 100%%");
               }  
             }
             else
@@ -1518,7 +1536,7 @@ script:
                 id(diesel_burner_slow_pwm_val) = 0.5;
                 id(diesel_burner_time_on_full) = 0;
                 id(diesel_burner_slow_pwm).set_level(0.5);
-                ESP_LOGD("custom", "Setting PWM to 50%");
+                ESP_LOGD("custom", "Setting PWM to 50%%");
               }
             }
           }
@@ -1536,31 +1554,30 @@ script:
             if (id(floor_temp_value) > id(floor_temp_limit))
             {
               //if floor pump is on turn it off
-              //if (id(floor_pump).state)
-              if (id(floor_pump_state) > 0.51)
+              if (id(floor_pump).state)
               {
-                id(floor_pump_state) = 0;
                 id(floor_pump).turn_off();
                 ESP_LOGD("custom", "Turning floor pump off");
               }  
             }
             else if (id(floor_temp_value) < id(floor_temp_limit) - 3)
             {
-              // if (!id(floor_pump).state)  //Only if on
-              if (id(floor_pump_state) < 0.51)
+              if (!id(floor_pump).state)  //Only if on
               {
-                id(floor_pump_state) = 1;
                 id(floor_pump).turn_on();
                 ESP_LOGD("custom", "Turning floor pump on");
               }
             }
           }
-          ESP_LOGD("custom", "Exited floor_heat_temperature_limit_control, floor_pump_state %.1f, floor_temp_value %.1f", (float)id(floor_pump_state), (float)id(floor_temp_value));
+          ESP_LOGD("custom", "Exited floor_heat_temperature_limit_control, floor_pump %.1f, floor_temp_value %.1f",
+                   id(floor_pump).state ? 1.0f : 0.0f,
+                   (float)id(floor_temp_value));
 
 
   # Update Fan Speed, temp diffs in deg C, 0.5556 deg C = 1 deg F!!! Were 0.5, 1.0, 2.5, med blower speed was 50
   # Changed to work both for cooling and heating 2nd stage (supplemental)
   - id: update_fan_speed
+    mode: queued
     then:
       - logger.log:
           format: "Called update_fan_speed script"
@@ -1585,6 +1602,15 @@ script:
               id(purge_hold_fan_speed) = id(current_fan);
             }
             return;
+          }
+          
+          if (id(purge_blower) == 0 && id(purge_hold_fan_speed) > 0)
+          {
+              id(current_fan) = id(purge_hold_fan_speed);
+              auto call = id(blower_fan).make_call();
+              call.set_speed(id(current_fan));
+              call.perform();
+              id(purge_hold_fan_speed) = 0;
           }
 
           if (id(this_thermostat).fan_mode == CLIMATE_FAN_AUTO)
