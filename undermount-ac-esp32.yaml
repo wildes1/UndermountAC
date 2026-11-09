@@ -29,6 +29,7 @@
 ##  051826 - Added purge_blower variable as the blower was being started and stopped prematurely by the fan speed script
 ##  061326 - modbus no longer supports role:server so commented it out, added hvac_fan_purge_delay
 ##  110726 - Implemented auto selection of min or max temp based on mode, also added Verbose debug logging which switches between debug and info
+##  110826 - Refactored modbus once again to keep relays sync'd to the states they should be in
 ##
 ##
 ##    HVAC Enable slow_pwm switch: on enables slow PWM behavior similar to described below, off disables slow PWM, burner is on constantly when heat is called
@@ -91,22 +92,27 @@ esphome:
   # so you can use a single firmware for all devices
   name_add_mac_suffix: false
   
+  # ... your existing configuration lines (name, platform, etc.) ...
   on_boot:
-    # 1. Early stage actions (Priority -100 runs early in the boot cycle)
-    - priority: -100
+    # 1. Early stage actions: Forces your PWM safety level to 0% immediately on hardware power-up
+    - priority: 100.0
       then:
         - output.set_level:
             id: diesel_burner_slow_pwm
             level: 0%
 
-    # 2. Late stage actions (Priority 100.0 runs after all components are ready)
-    - priority: 100.0
+    # 2. Late stage actions: Runs AFTER all Modbus hubs and sensors are completely ready and stable
+    - priority: -100.0
       then:
         - globals.set:
             id: system_ready
             value: 'true'
         - component.update: selected_cabin_temp
-#  # configuration and updates. Also needed for dashboard_import below
+        
+        # # Safe to fire our Modbus address scanner script now!
+        # - script.execute: scan_modbus_addresses
+
+          #  # configuration and updates. Also needed for dashboard_import below
 #  project:
 #    name: wildes1.undermount-ac
 #    version: "0.1"
@@ -180,6 +186,51 @@ web_server:
 improv_serial:
 
 globals:
+  # - id: scanner_current_address
+  #   type: int
+  #   restore_value: no
+  #   initial_value: '247' # Start at the highest valid Modbus address
+
+  - id: hot_water_recirc_current_retry_count
+    type: int
+    restore_value: no
+    initial_value: '0'
+    
+  - id: hot_water_recirc_hardware_state
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  
+  - id: heat_coil_bypass_current_retry_count
+    type: int
+    restore_value: no
+    initial_value: '0'
+    
+  - id: heat_coil_bypass_hardware_state
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+    
+  - id: diesel_burner_current_retry_count
+    type: int
+    restore_value: no
+    initial_value: '0'
+    
+  - id: diesel_burner_hardware_state
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: floor_pump_hardware_state
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+    
+  - id: floor_pump_current_retry_count
+    type: int
+    restore_value: no
+    initial_value: '0'
+    
   - id: last_hvac_mode
     type: int
     restore_value: no
@@ -368,8 +419,43 @@ modbus_controller:
     address: 0xfe #Broadcast address works on units as shipped from Undermount AC (Default address of 0 does not work per doc)
     # update_interval: 1s
 
-#binary_sensor: #no binary_sensors
+# #binary_sensor: #no binary_sensors
+# binary_sensor:
+#   - platform: modbus_controller
+#     modbus_controller_id: csio_1
+#     name: "Floor Pump Hardware Feedback"
+#     id: floor_pump_feedback
+#     register_type: coil
+#     address: 2 # Directly checks coil 0x0002
+binary_sensor:
+  - platform: template
+    name: "Floor Pump Hardware Verification"
+    id: floor_pump_status
+    device_class: running
+    lambda: |-
+      return id(floor_pump_hardware_state);
 
+  - platform: template
+    name: "Diesel Burner Hardware Verification"
+    id: diesel_burner_status
+    device_class: running
+    lambda: |-
+      return id(diesel_burner_hardware_state);
+
+  - platform: template
+    name: "Heat Coil Bypass Hardware Verification"
+    id: heat_coil_bypass_status
+    device_class: running
+    lambda: |-
+      return id(heat_coil_bypass_hardware_state);
+
+  - platform: template
+    name: "Hot Water Recirc Hardware Verification"
+    id: hot_water_recirc_status
+    device_class: running
+    lambda: |-
+      return id(hot_water_recirc_hardware_state);
+      
 # Status LED
 light:
   # ESPHome status LED - controls an output (to use onboard RGB LED)
@@ -722,7 +808,7 @@ switch:
     name: "Verbose Debug Logging"
     id: verbose_logging_switch
     optimistic: true
-    restore_mode: ALWAYS_OFF
+    restore_mode: ALWAYS_ON
     
     turn_on_action:
       - lambda: |-
@@ -765,6 +851,7 @@ switch:
 ##########################################################
   # Floor Pump control
   # Previously used floor_pump_state for stability; now scripts publish state directly
+  
   - platform: template
     id: floor_pump
     name: "Floor Pump Control"
@@ -774,6 +861,18 @@ switch:
     turn_off_action:
       - script.execute: floor_pump_off
 
+  # =========================================================================
+  # EXPERIMENTAL RELAY: Native Closed-Loop Modbus Control
+  # =========================================================================
+  
+  # - platform: modbus_controller
+  #   modbus_controller_id: csio_1
+  #   name: "Floor Pump Control"
+  #   id: floor_pump
+  #   # DFRobot FIT0827 maps Channel 3 to Coil address 0x0002
+  #   register_type: coil
+  #   address: 2
+  
 ##########################################################
   # Hot Water Recirc control
   # does not use uses hot_water_recirc_state to turn on and off as it must be controlled by HA user as well and we will tolerate on/off/on...
@@ -1290,43 +1389,109 @@ script:
     mode: queued
     then:
       - lambda: |-
-          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x00,0xFF,0x00};
+          id(diesel_burner_current_retry_count) = 0;
+      
+      - while:
+          condition:
+            lambda: 'return id(diesel_burner_current_retry_count) <= 2;'
+          then:
+            - lambda: |-
+                if (id(diesel_burner_current_retry_count) > 0) {
+                  ESP_LOGW("modbus_verify", "Diesel Burner ON retry triggered... (Attempt %d/2)", id(diesel_burner_current_retry_count));
+                }
+                
+                while(id(modbus_server)->available() > 0) { uint8_t dump; id(modbus_server)->read_byte(&dump); }
+                
+                // Write Single Coil to Address 0x0000 -> 0xFF00 (ON) via address 0xFE
+                std::vector<uint8_t> frame = {0xFE, 0x05, 0x00, 0x00, 0xFF, 0x00};
+                uint16_t crc = 0xFFFF;
+                for (size_t i = 0; i < frame.size(); i++) {
+                  crc ^= frame[i];
+                  for (int b = 0; b < 8; b++)
+                    crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+                }
+                frame.push_back(crc & 0xFF);
+                frame.push_back(crc >> 8);
+                
+                id(modbus_server)->write_array(frame);
+                id(modbus_server)->flush();
+                
+                delay(35);
+                while(id(modbus_server)->available() > 0) { uint8_t dump; id(modbus_server)->read_byte(&dump); }
 
-          // Publish state here (switch no longer auto‑reverts)
-          id(diesel_burner).publish_state(true);
+            - delay: 265ms
 
-          // CRC16
-          uint16_t crc = 0xFFFF;
-          for (size_t i = 0; i < frame.size(); i++) {
-            crc ^= frame[i];
-            for (int b = 0; b < 8; b++)
-              crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
-          }
-          frame.push_back(crc & 0xFF);
-          frame.push_back(crc >> 8);
-
-          id(modbus_server)->write_array(frame);
+            - if:
+                condition:
+                  lambda: |-
+                    if (id(modbus_server)->available() == 0) {
+                      return true;
+                    }
+                    while (id(modbus_server)->available() > 0) { uint8_t val; id(modbus_server)->read_byte(&val); }
+                    return false;
+                then:
+                  - lambda: |-
+                      id(diesel_burner).publish_state(true);
+                      id(diesel_burner_hardware_state) = true; 
+                      ESP_LOGI("modbus_verify", "Diesel Burner successfully toggled and verified ON.");
+                      id(diesel_burner_current_retry_count) = 99;
+                else:
+                  - lambda: |-
+                      id(diesel_burner_current_retry_count)++;
 
   - id: diesel_burner_off
     mode: queued
     then:
       - lambda: |-
-          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x00,0x00,0x00};
+          id(diesel_burner_current_retry_count) = 0;
+      
+      - while:
+          condition:
+            lambda: 'return id(diesel_burner_current_retry_count) <= 2;'
+          then:
+            - lambda: |-
+                if (id(diesel_burner_current_retry_count) > 0) {
+                  ESP_LOGW("modbus_verify", "Diesel Burner OFF retry triggered... (Attempt %d/2)", id(diesel_burner_current_retry_count));
+                }
+                
+                while(id(modbus_server)->available() > 0) { uint8_t dump; id(modbus_server)->read_byte(&dump); }
+                
+                // Write Single Coil to Address 0x0000 -> 0x0000 (OFF) via address 0xFE
+                std::vector<uint8_t> frame = {0xFE, 0x05, 0x00, 0x00, 0x00, 0x00};
+                uint16_t crc = 0xFFFF;
+                for (size_t i = 0; i < frame.size(); i++) {
+                  crc ^= frame[i];
+                  for (int b = 0; b < 8; b++)
+                    crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+                }
+                frame.push_back(crc & 0xFF);
+                frame.push_back(crc >> 8);
+                
+                id(modbus_server)->write_array(frame);
+                id(modbus_server)->flush();
+                
+                delay(35);
+                while(id(modbus_server)->available() > 0) { uint8_t dump; id(modbus_server)->read_byte(&dump); }
 
-          // Publish state here
-          id(diesel_burner).publish_state(false);
+            - delay: 265ms
 
-          // CRC16
-          uint16_t crc = 0xFFFF;
-          for (size_t i = 0; i < frame.size(); i++) {
-            crc ^= frame[i];
-            for (int b = 0; b < 8; b++)
-              crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
-          }
-          frame.push_back(crc & 0xFF);
-          frame.push_back(crc >> 8);
-
-          id(modbus_server)->write_array(frame);
+            - if:
+                condition:
+                  lambda: |-
+                    if (id(modbus_server)->available() == 0) {
+                      return true;
+                    }
+                    while (id(modbus_server)->available() > 0) { uint8_t val; id(modbus_server)->read_byte(&val); }
+                    return false;
+                then:
+                  - lambda: |-
+                      id(diesel_burner).publish_state(false);
+                      id(diesel_burner_hardware_state) = false; 
+                      ESP_LOGI("modbus_verify", "Diesel Burner successfully toggled and verified OFF.");
+                      id(diesel_burner_current_retry_count) = 99;
+                else:
+                  - lambda: |-
+                      id(diesel_burner_current_retry_count)++;
 
   ##########################################################
   # Heat Coil Bypass Valve — sends custom Modbus frame
@@ -1335,138 +1500,411 @@ script:
     mode: queued
     then:
       - lambda: |-
-          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x01,0xFF,0x00};
+          id(heat_coil_bypass_current_retry_count) = 0;
+      
+      - while:
+          condition:
+            lambda: 'return id(heat_coil_bypass_current_retry_count) <= 2;'
+          then:
+            - lambda: |-
+                if (id(heat_coil_bypass_current_retry_count) > 0) {
+                  ESP_LOGW("modbus_verify", "Heat Coil Bypass ON retry triggered... (Attempt %d/2)", id(heat_coil_bypass_current_retry_count));
+                }
+                
+                while(id(modbus_server)->available() > 0) { uint8_t dump; id(modbus_server)->read_byte(&dump); }
+                
+                // Write Single Coil to Address 0x0001 -> 0xFF00 (ON) via address 0xFE
+                std::vector<uint8_t> frame = {0xFE, 0x05, 0x00, 0x01, 0xFF, 0x00};
+                uint16_t crc = 0xFFFF;
+                for (size_t i = 0; i < frame.size(); i++) {
+                  crc ^= frame[i];
+                  for (int b = 0; b < 8; b++)
+                    crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+                }
+                frame.push_back(crc & 0xFF);
+                frame.push_back(crc >> 8);
+                
+                id(modbus_server)->write_array(frame);
+                id(modbus_server)->flush();
+                
+                delay(35);
+                while(id(modbus_server)->available() > 0) { uint8_t dump; id(modbus_server)->read_byte(&dump); }
 
-          // Publish state here
-          id(heat_coil_bypass).publish_state(true);
+            - delay: 265ms
 
-          // CRC16
-          uint16_t crc = 0xFFFF;
-          for (size_t i = 0; i < frame.size(); i++) {
-            crc ^= frame[i];
-            for (int b = 0; b < 8; b++)
-              crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
-          }
-          frame.push_back(crc & 0xFF);
-          frame.push_back(crc >> 8);
-
-          id(modbus_server)->write_array(frame);
+            - if:
+                condition:
+                  lambda: |-
+                    if (id(modbus_server)->available() == 0) {
+                      return true;
+                    }
+                    while (id(modbus_server)->available() > 0) { uint8_t val; id(modbus_server)->read_byte(&val); }
+                    return false;
+                then:
+                  - lambda: |-
+                      id(heat_coil_bypass).publish_state(true);
+                      id(heat_coil_bypass_hardware_state) = true; 
+                      ESP_LOGI("modbus_verify", "Heat Coil Bypass successfully toggled and verified ON.");
+                      id(heat_coil_bypass_current_retry_count) = 99;
+                else:
+                  - lambda: |-
+                      id(heat_coil_bypass_current_retry_count)++;
 
   - id: heat_coil_bypass_off
     mode: queued
     then:
       - lambda: |-
-          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x01,0x00,0x00};
+          id(heat_coil_bypass_current_retry_count) = 0;
+      
+      - while:
+          condition:
+            lambda: 'return id(heat_coil_bypass_current_retry_count) <= 2;'
+          then:
+            - lambda: |-
+                if (id(heat_coil_bypass_current_retry_count) > 0) {
+                  ESP_LOGW("modbus_verify", "Heat Coil Bypass OFF retry triggered... (Attempt %d/2)", id(heat_coil_bypass_current_retry_count));
+                }
+                
+                while(id(modbus_server)->available() > 0) { uint8_t dump; id(modbus_server)->read_byte(&dump); }
+                
+                // Write Single Coil to Address 0x0001 -> 0x0000 (OFF) via address 0xFE
+                std::vector<uint8_t> frame = {0xFE, 0x05, 0x00, 0x01, 0x00, 0x00};
+                uint16_t crc = 0xFFFF;
+                for (size_t i = 0; i < frame.size(); i++) {
+                  crc ^= frame[i];
+                  for (int b = 0; b < 8; b++)
+                    crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+                }
+                frame.push_back(crc & 0xFF);
+                frame.push_back(crc >> 8);
+                
+                id(modbus_server)->write_array(frame);
+                id(modbus_server)->flush();
+                
+                delay(35);
+                while(id(modbus_server)->available() > 0) { uint8_t dump; id(modbus_server)->read_byte(&dump); }
 
-          // Publish state here
-          id(heat_coil_bypass).publish_state(false);
+            - delay: 265ms
 
-          // CRC16
-          uint16_t crc = 0xFFFF;
-          for (size_t i = 0; i < frame.size(); i++) {
-            crc ^= frame[i];
-            for (int b = 0; b < 8; b++)
-              crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
-          }
-          frame.push_back(crc & 0xFF);
-          frame.push_back(crc >> 8);
-
-          id(modbus_server)->write_array(frame);
+            - if:
+                condition:
+                  lambda: |-
+                    if (id(modbus_server)->available() == 0) {
+                      return true;
+                    }
+                    while (id(modbus_server)->available() > 0) { uint8_t val; id(modbus_server)->read_byte(&val); }
+                    return false;
+                then:
+                  - lambda: |-
+                      id(heat_coil_bypass).publish_state(false);
+                      id(heat_coil_bypass_hardware_state) = false; 
+                      ESP_LOGI("modbus_verify", "Heat Coil Bypass successfully toggled and verified OFF.");
+                      id(heat_coil_bypass_current_retry_count) = 99;
+                else:
+                  - lambda: |-
+                      id(heat_coil_bypass_current_retry_count)++;
 
   ##########################################################
   # Floor Pump control — sends custom Modbus frame
   ##########################################################
+  # # 1. Launcher Script: Initializes the pass parameters
+  # - id: start_exhaustive_scan
+  #   mode: restart
+  #   then:
+  #     - lambda: |-
+  #         id(scanner_current_address) = 247;
+  #         ESP_LOGI("address_scanner", "==================================================");
+  #         ESP_LOGI("address_scanner", "STARTING SAFE MODBUS SCAN (HIGHEST -> LOWEST)...");
+  #         ESP_LOGI("address_scanner", "==================================================");
+  #     - script.execute: probe_single_address
+
+  # - id: probe_single_address
+  #   mode: restart
+  #   then:
+  #     - lambda: |-
+  #         int addr = id(scanner_current_address);
+          
+  #         if (addr < 1) {
+  #           ESP_LOGI("address_scanner", "==================================================");
+  #           ESP_LOGI("address_scanner", "🎉 EXHAUSTIVE MODBUS BUS SCAN COMPLETE!");
+  #           ESP_LOGI("address_scanner", "==================================================");
+  #           return;
+  #         }
+
+  #         // Flush any stale bytes out of the hardware registers
+  #         while(id(modbus_server)->available() > 0) { uint8_t dump; id(modbus_server)->read_byte(&dump); }
+
+  #         std::vector<uint8_t> frame = {(uint8_t)addr, 0x01, 0x00, 0x00, 0x00, 0x04};
+  #         uint16_t crc = 0xFFFF;
+  #         for (size_t i = 0; i < frame.size(); i++) {
+  #           crc ^= frame[i];
+  #           for (int b = 0; b < 8; b++)
+  #             crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+  #         }
+  #         frame.push_back(crc & 0xFF);
+  #         frame.push_back(crc >> 8);
+
+  #         // Heartbeat indicator printed directly to screen
+  #         ESP_LOGI("address_scanner", "Probing address index: 0x%02X (%d)...", addr, addr);
+
+  #         id(modbus_server)->write_array(frame);
+  #         id(modbus_server)->flush();
+
+  #     # EXTENDED WAIT TIME: Gives the 127ms hardware loopback echo time to land completely
+  #     - delay: 150ms
+
+  #     - lambda: |-
+  #         int addr = id(scanner_current_address);
+  #         std::vector<uint8_t> response;
+          
+  #         while (id(modbus_server)->available() > 0) {
+  #           uint8_t val;
+  #           id(modbus_server)->read_byte(&val);
+  #           response.push_back(val);
+  #         }
+          
+  #         // Echos are typically 1 or 2 zero bytes (0x00). If we get real data, it will be longer.
+  #         if (response.size() > 0) {
+  #           // Check if it's a true Modbus data payload reply frame or just loopback noise
+  #           if (response.size() >= 4 && response[0] == addr && response[1] == 0x01) {
+  #             ESP_LOGI("address_scanner", "--------------------------------------------------");
+  #             ESP_LOGI("address_scanner", "🎉 LIVE DEVICE CONFIRMED ON ADDRESS: 0x%02X (%d)", addr, addr);
+  #             ESP_LOGI("address_scanner", "Raw Captured String: %s", format_hex_pretty(response).c_str());
+  #             ESP_LOGI("address_scanner", "--------------------------------------------------");
+  #           } else {
+  #             // It was just the transceiver line echo. Log it quietly as a low-level debug or skip
+  #             ESP_LOGD("address_scanner", "Address 0x%02X returned loopback echo: %s", addr, format_hex_pretty(response).c_str());
+  #           }
+  #         }
+
+  #         id(scanner_current_address)--;
+
+  #     # Brief pause to completely satisfy background watchdogs
+  #     - delay: 10ms
+  #     - script.execute: probe_single_address
+        
   - id: floor_pump_on
     mode: queued
     then:
       - lambda: |-
-          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x02,0xFF,0x00};
+          id(floor_pump_current_retry_count) = 0;
+      
+      - while:
+          condition:
+            lambda: 'return id(floor_pump_current_retry_count) <= 2;'
+          then:
+            - lambda: |-
+                if (id(floor_pump_current_retry_count) > 0) {
+                  ESP_LOGW("modbus_verify", "Floor Pump ON retry triggered... (Attempt %d/2)", id(floor_pump_current_retry_count));
+                }
+                
+                while(id(modbus_server)->available() > 0) { uint8_t dump; id(modbus_server)->read_byte(&dump); }
+                
+                std::vector<uint8_t> frame = {0xFE, 0x05, 0x00, 0x02, 0xFF, 0x00};
+                uint16_t crc = 0xFFFF;
+                for (size_t i = 0; i < frame.size(); i++) {
+                  crc ^= frame[i];
+                  for (int b = 0; b < 8; b++)
+                    crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+                }
+                frame.push_back(crc & 0xFF);
+                frame.push_back(crc >> 8);
+                
+                id(modbus_server)->write_array(frame);
+                id(modbus_server)->flush();
+                
+                delay(35);
+                while(id(modbus_server)->available() > 0) { uint8_t dump; id(modbus_server)->read_byte(&dump); }
 
-          // Publish state here
-          id(floor_pump).publish_state(true);
+            - delay: 265ms
 
-          // CRC16
-          uint16_t crc = 0xFFFF;
-          for (size_t i = 0; i < frame.size(); i++) {
-            crc ^= frame[i];
-            for (int b = 0; b < 8; b++)
-              crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
-          }
-          frame.push_back(crc & 0xFF);
-          frame.push_back(crc >> 8);
-
-          id(modbus_server)->write_array(frame);
+            - if:
+                condition:
+                  lambda: |-
+                    if (id(modbus_server)->available() == 0) {
+                      return true;
+                    }
+                    while (id(modbus_server)->available() > 0) { uint8_t val; id(modbus_server)->read_byte(&val); }
+                    return false;
+                then:
+                  - lambda: |-
+                      id(floor_pump).publish_state(true);
+                      id(floor_pump_hardware_state) = true; 
+                      ESP_LOGI("modbus_verify", "Floor Pump successfully toggled and verified ON.");
+                      id(floor_pump_current_retry_count) = 99;
+                else:
+                  - lambda: |-
+                      id(floor_pump_current_retry_count)++;
 
   - id: floor_pump_off
     mode: queued
     then:
       - lambda: |-
-          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x02,0x00,0x00};
+          id(floor_pump_current_retry_count) = 0;
+      
+      - while:
+          condition:
+            lambda: 'return id(floor_pump_current_retry_count) <= 2;'
+          then:
+            - lambda: |-
+                if (id(floor_pump_current_retry_count) > 0) {
+                  ESP_LOGW("modbus_verify", "Floor Pump OFF retry triggered... (Attempt %d/2)", id(floor_pump_current_retry_count));
+                }
+                
+                while(id(modbus_server)->available() > 0) { uint8_t dump; id(modbus_server)->read_byte(&dump); }
+                
+                std::vector<uint8_t> frame = {0xFE, 0x05, 0x00, 0x02, 0x00, 0x00};
+                uint16_t crc = 0xFFFF;
+                for (size_t i = 0; i < frame.size(); i++) {
+                  crc ^= frame[i];
+                  for (int b = 0; b < 8; b++)
+                    crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+                }
+                frame.push_back(crc & 0xFF);
+                frame.push_back(crc >> 8);
+                
+                id(modbus_server)->write_array(frame);
+                id(modbus_server)->flush();
+                
+                delay(35);
+                while(id(modbus_server)->available() > 0) { uint8_t dump; id(modbus_server)->read_byte(&dump); }
 
-          // Publish state here
-          id(floor_pump).publish_state(false);
+            - delay: 265ms
 
-          // CRC16
-          uint16_t crc = 0xFFFF;
-          for (size_t i = 0; i < frame.size(); i++) {
-            crc ^= frame[i];
-            for (int b = 0; b < 8; b++)
-              crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
-          }
-          frame.push_back(crc & 0xFF);
-          frame.push_back(crc >> 8);
-
-          id(modbus_server)->write_array(frame);
-
+            - if:
+                condition:
+                  lambda: |-
+                    if (id(modbus_server)->available() == 0) {
+                      return true;
+                    }
+                    while (id(modbus_server)->available() > 0) { uint8_t val; id(modbus_server)->read_byte(&val); }
+                    return false;
+                then:
+                  - lambda: |-
+                      id(floor_pump).publish_state(false);
+                      id(floor_pump_hardware_state) = false; 
+                      ESP_LOGI("modbus_verify", "Floor Pump successfully toggled and verified OFF.");
+                      id(floor_pump_current_retry_count) = 99;
+                else:
+                  - lambda: |-
+                      id(floor_pump_current_retry_count)++;
+                      
   ##########################################################
-  # Hot Water Recirc — ON command (NO _state)
+  # Hot Water Recirc —  sends custom Modbus frame
   ##########################################################
   - id: hot_water_recirc_on
     mode: queued
     then:
       - lambda: |-
-          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x03,0xFF,0x00};
+          id(hot_water_recirc_current_retry_count) = 0;
+      
+      - while:
+          condition:
+            lambda: 'return id(hot_water_recirc_current_retry_count) <= 2;'
+          then:
+            - lambda: |-
+                if (id(hot_water_recirc_current_retry_count) > 0) {
+                  ESP_LOGW("modbus_verify", "Hot Water Recirc ON retry triggered... (Attempt %d/2)", id(hot_water_recirc_current_retry_count));
+                }
+                
+                while(id(modbus_server)->available() > 0) { uint8_t dump; id(modbus_server)->read_byte(&dump); }
+                
+                // Write Single Coil to Address 0x0003 -> 0xFF00 (ON) via address 0xFE
+                std::vector<uint8_t> frame = {0xFE, 0x05, 0x00, 0x03, 0xFF, 0x00};
+                uint16_t crc = 0xFFFF;
+                for (size_t i = 0; i < frame.size(); i++) {
+                  crc ^= frame[i];
+                  for (int b = 0; b < 8; b++)
+                    crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+                }
+                frame.push_back(crc & 0xFF);
+                frame.push_back(crc >> 8);
+                
+                id(modbus_server)->write_array(frame);
+                id(modbus_server)->flush();
+                
+                delay(35);
+                while(id(modbus_server)->available() > 0) { uint8_t dump; id(modbus_server)->read_byte(&dump); }
 
-          // Publish state here
-          id(hot_water_recirc).publish_state(true);
+            - delay: 265ms
 
-          // CRC16
-          uint16_t crc = 0xFFFF;
-          for (size_t i = 0; i < frame.size(); i++) {
-            crc ^= frame[i];
-            for (int b = 0; b < 8; b++)
-              crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
-          }
-          frame.push_back(crc & 0xFF);
-          frame.push_back(crc >> 8);
+            - if:
+                condition:
+                  lambda: |-
+                    if (id(modbus_server)->available() == 0) {
+                      return true;
+                    }
+                    while (id(modbus_server)->available() > 0) { uint8_t val; id(modbus_server)->read_byte(&val); }
+                    return false;
+                then:
+                  - lambda: |-
+                      id(hot_water_recirc).publish_state(true);
+                      id(hot_water_recirc_hardware_state) = true; 
+                      ESP_LOGI("modbus_verify", "Hot Water Recirc successfully toggled and verified ON.");
+                      id(hot_water_recirc_current_retry_count) = 99;
+                else:
+                  - lambda: |-
+                      id(hot_water_recirc_current_retry_count)++;
 
-          id(modbus_server)->write_array(frame);
-
-
-  ##########################################################
-  # Hot Water Recirc — OFF command (NO _state)
-  ##########################################################
   - id: hot_water_recirc_off
     mode: queued
     then:
       - lambda: |-
-          std::vector<uint8_t> frame = {0xFE,0x05,0x00,0x03,0x00,0x00};
+          id(hot_water_recirc_current_retry_count) = 0;
+      
+      - while:
+          condition:
+            lambda: 'return id(hot_water_recirc_current_retry_count) <= 2;'
+          then:
+            - lambda: |-
+                if (id(hot_water_recirc_current_retry_count) > 0) {
+                  ESP_LOGW("modbus_verify", "Hot Water Recirc OFF retry triggered... (Attempt %d/2)", id(hot_water_recirc_current_retry_count));
+                }
+                
+                while(id(modbus_server)->available() > 0) { uint8_t dump; id(modbus_server)->read_byte(&dump); }
+                
+                // Write Single Coil to Address 0x0003 -> 0x0000 (OFF) via address 0xFE
+                std::vector<uint8_t> frame = {0xFE, 0x05, 0x00, 0x03, 0x00, 0x00};
+                uint16_t crc = 0xFFFF;
+                for (size_t i = 0; i < frame.size(); i++) {
+                  crc ^= frame[i];
+                  for (int b = 0; b < 8; b++)
+                    crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+                }
+                frame.push_back(crc & 0xFF);
+                frame.push_back(crc >> 8);
+                
+                id(modbus_server)->write_array(frame);
+                id(modbus_server)->flush();
+                
+                delay(35);
+                while(id(modbus_server)->available() > 0) { uint8_t dump; id(modbus_server)->read_byte(&dump); }
 
-          // Publish state here
-          id(hot_water_recirc).publish_state(false);
+            - delay: 265ms
 
-          // CRC16
-          uint16_t crc = 0xFFFF;
-          for (size_t i = 0; i < frame.size(); i++) {
-            crc ^= frame[i];
-            for (int b = 0; b < 8; b++)
-              crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
-          }
-          frame.push_back(crc & 0xFF);
-          frame.push_back(crc >> 8);
-
-          id(modbus_server)->write_array(frame);
+            - if:
+                condition:
+                  lambda: |-
+                    if (id(modbus_server)->available() == 0) {
+                      return true;
+                    }
+                    while (id(modbus_server)->available() > 0) { uint8_t val; id(modbus_server)->read_byte(&val); }
+                    return false;
+                then:
+                  - lambda: |-
+                      id(hot_water_recirc).publish_state(false);
+                      id(hot_water_recirc_hardware_state) = false; 
+                      ESP_LOGI("modbus_verify", "Hot Water Recirc successfully toggled and verified OFF.");
+                      id(hot_water_recirc_current_retry_count) = 99;
+                else:
+                  - lambda: |-
+                      id(hot_water_recirc_current_retry_count)++;
           
+  ##########################################################
+  ##########################################################
+  # Other scripts
+  ##########################################################
+  ##########################################################
   - id: update_water_heater_status
     then:
       - logger.log:
@@ -1882,13 +2320,63 @@ interval:
             - switch.turn_off: compressor_speed_high
             - switch.turn_off: air_cond
 
+  # - interval: 10s # Polls the line independently every 10 seconds
+  #   then:
+  #     - script.execute: verify_floor_pump_hardware
+
 ## Run temp sensors every minute (minimize heating, prevent failures with some sensors)...
 ##   This is debugged but should only be used if there are sensor lock up issues
 ##   due to the fact that silicon lasts longer when not power cycled (device is buried in the floor
 ##   and not easily replacable), to use must also uncomment update_interval: never in sensor floor_temp
-#interval:
-#  - interval: 60s
-#    then:
+
+  - interval: 60s
+    then:
+      - lambda: |-
+          // Check what state Home Assistant expects the switch to be in
+          if (id(floor_pump).state) {
+            ESP_LOGD("modbus_refresh", "Interval Triggered: Enforcing Floor Pump ON state...");
+            id(floor_pump_on).execute();
+          } else {
+            ESP_LOGD("modbus_refresh", "Interval Triggered: Enforcing Floor Pump OFF state...");
+            id(floor_pump_off).execute();
+          }
+
+  - interval: 60s
+    then:
+      - lambda: |-
+          if (id(diesel_burner).state) {
+            ESP_LOGD("modbus_refresh", "Interval Triggered: Enforcing Diesel Burner ON state...");
+            id(diesel_burner_on).execute();
+          } else {
+            ESP_LOGD("modbus_refresh", "Interval Triggered: Enforcing Diesel Burner OFF state...");
+            id(diesel_burner_off).execute();
+          }
+
+  - interval: 60s
+    then:
+      - lambda: |-
+          if (id(heat_coil_bypass).state) {
+            ESP_LOGD("modbus_refresh", "Interval Triggered: Enforcing Heat Coil Bypass ON state...");
+            id(heat_coil_bypass_on).execute();
+          } else {
+            ESP_LOGD("modbus_refresh", "Interval Triggered: Enforcing Heat Coil Bypass OFF state...");
+            id(heat_coil_bypass_off).execute();
+          }
+
+  - interval: 60s
+    then:
+      - lambda: |-
+          if (id(hot_water_recirc).state) {
+            ESP_LOGD("modbus_refresh", "Interval Triggered: Enforcing Hot Water Recirc ON state...");
+            id(hot_water_recirc_on).execute();
+          } else {
+            ESP_LOGD("modbus_refresh", "Interval Triggered: Enforcing Hot Water Recirc OFF state...");
+            id(hot_water_recirc_off).execute();
+          }
+
+  # - interval: 60s
+  #   then:
+  #     - script.execute: start_exhaustive_scan
 #      - switch.turn_on: one_wire_sw
 #      - delay: 2s
 #      - component.update: floor_temp
